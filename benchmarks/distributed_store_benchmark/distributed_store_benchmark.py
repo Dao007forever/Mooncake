@@ -221,6 +221,20 @@ class DistributedStoreBackend:
             self._written_keys.clear()
         return removed
 
+    def reset_stats(self):
+        """Zero counters and latency samples without dropping the written-key
+        set. Used between phases of --mode=preload-read so the reported
+        numbers reflect only the read phase."""
+        with self._stats_lock:
+            self.stats = {
+                'read_count': 0,
+                'write_count': 0,
+                'read_bytes': 0,
+                'write_bytes': 0,
+                'read_latencies_ms': [],
+                'write_latencies_ms': [],
+            }
+
     def close(self):
         try:
             self.store.close()
@@ -329,6 +343,18 @@ class StoreBenchmark:
             self.stats['request_latencies_ms'].append(latency_ms)
         return latency_ms
 
+    def reset_stats(self):
+        with self._lock:
+            self.stats = {
+                'total_requests': 0,
+                'total_blocks': 0,
+                'read_blocks': 0,
+                'write_blocks': 0,
+                'prefix_hit_blocks': 0,
+                'read_miss_blocks': 0,
+                'request_latencies_ms': [],
+            }
+
     def get_stats(self) -> Dict:
         storage_stats = self.backend.get_stats()
         with self._lock:
@@ -433,7 +459,8 @@ def run_benchmark(trace_path: str, config: Dict, bytes_per_token: int,
                   replay_timestamps: bool, time_scale: float,
                   key_prefix: str, cleanup: bool,
                   concurrency: int = 1, mode: str = 'mixed',
-                  read_iterations: int = 1) -> Dict:
+                  read_iterations: int = 1,
+                  preload_concurrency: int = 2) -> Dict:
     block_size_bytes = block_size_tokens * bytes_per_token
 
     print(f"\n{'='*80}")
@@ -453,7 +480,9 @@ def run_benchmark(trace_path: str, config: Dict, bytes_per_token: int,
     print(f"Key prefix: {key_prefix}")
     print(f"Concurrency: {concurrency} worker(s)")
     print(f"Mode: {mode}")
-    if mode == 'read':
+    if mode == 'preload-read':
+        print(f"Preload concurrency: {preload_concurrency} worker(s)")
+    if mode in ('read', 'preload-read'):
         print(f"Read iterations: {read_iterations}")
     print(f"Timestamp replay: "
           f"{'Enabled' if replay_timestamps else 'Disabled'}")
@@ -471,6 +500,10 @@ def run_benchmark(trace_path: str, config: Dict, bytes_per_token: int,
         requests = base_requests * read_iterations
         print(f"Loaded {len(base_requests)} requests "
               f"(replaying {read_iterations}x = {len(requests)} total)")
+    elif mode == 'preload-read':
+        requests = base_requests  # preload uses 1x; read phase scheduled below
+        print(f"Loaded {len(base_requests)} base requests "
+              f"(preload 1x, then read {read_iterations}x)")
     else:
         requests = base_requests
         print(f"Loaded {len(requests)} requests")
@@ -480,72 +513,105 @@ def run_benchmark(trace_path: str, config: Dict, bytes_per_token: int,
         key_prefix=key_prefix,
     ) as backend:
         benchmark = StoreBenchmark(backend)
-
-        def do_request(req):
-            req_start = time.perf_counter()
-            benchmark.process_request(req, mode=mode)
-            return time.perf_counter() - req_start
-
-        start_time = time.perf_counter()
-        total_io_time = 0.0
         io_time_lock = threading.Lock()
-        last_timestamp = None
-        base_time = time.time()
+        phase_io_time = [0.0]  # list so inner closures can mutate
 
-        if concurrency <= 1:
-            # Serial path — preserves original behavior and progress output.
-            for i, req in enumerate(requests):
-                if replay_timestamps and last_timestamp is not None:
-                    delta_ms = req.timestamp - last_timestamp
-                    sleep_time = delta_ms / 1000.0 / time_scale
-                    if sleep_time > 0:
-                        time.sleep(sleep_time)
+        def execute_phase(phase_requests, phase_mode, phase_concurrency,
+                          phase_label=None):
+            """Run one pass over phase_requests. Returns (elapsed_s, io_time_s).
+            Mutates phase_io_time[0] as a side channel for the serial+replay
+            bandwidth accounting below."""
+            phase_io_time[0] = 0.0
+            last_ts = None
+            base_wall = time.time()
 
-                total_io_time += do_request(req)
-                last_timestamp = req.timestamp
+            if phase_label:
+                print(f"\n--- {phase_label} "
+                      f"({len(phase_requests)} reqs, mode={phase_mode}, "
+                      f"concurrency={phase_concurrency}) ---")
 
-                if (i + 1) % 100 == 0:
-                    if replay_timestamps:
-                        elapsed_wall = time.time() - base_time
-                        sim = (req.timestamp - requests[0].timestamp) / 1000.0 / time_scale
-                        print(f"  Processed {i + 1}/{len(requests)}... "
-                              f"(wall: {elapsed_wall:.1f}s, sim: {sim:.1f}s, "
-                              f"io: {total_io_time:.1f}s)")
-                    else:
-                        print(f"  Processed {i + 1}/{len(requests)}...")
-        else:
-            # Concurrent path — N worker threads, producer respects replay
-            # pacing between submissions but execution is async.
-            completed = 0
-            completed_lock = threading.Lock()
+            def do_one(req):
+                req_start = time.perf_counter()
+                benchmark.process_request(req, mode=phase_mode)
+                return time.perf_counter() - req_start
 
-            def worker(req):
-                io_t = do_request(req)
-                with io_time_lock:
-                    nonlocal total_io_time
-                    total_io_time += io_t
-                with completed_lock:
-                    nonlocal completed
-                    completed += 1
-                    c = completed
-                if c % 100 == 0:
-                    print(f"  Completed {c}/{len(requests)}...")
+            t0 = time.perf_counter()
 
-            with ThreadPoolExecutor(max_workers=concurrency) as executor:
-                futures = []
-                for req in requests:
-                    if replay_timestamps and last_timestamp is not None:
-                        delta_ms = req.timestamp - last_timestamp
+            if phase_concurrency <= 1:
+                for i, req in enumerate(phase_requests):
+                    if replay_timestamps and last_ts is not None:
+                        delta_ms = req.timestamp - last_ts
                         sleep_time = delta_ms / 1000.0 / time_scale
                         if sleep_time > 0:
                             time.sleep(sleep_time)
-                    futures.append(executor.submit(worker, req))
-                    last_timestamp = req.timestamp
 
-                for fut in as_completed(futures):
-                    fut.result()  # surface exceptions
+                    phase_io_time[0] += do_one(req)
+                    last_ts = req.timestamp
 
-        elapsed = time.perf_counter() - start_time
+                    if (i + 1) % 100 == 0:
+                        if replay_timestamps:
+                            elapsed_wall = time.time() - base_wall
+                            sim = (req.timestamp - phase_requests[0].timestamp) / 1000.0 / time_scale
+                            print(f"  Processed {i + 1}/{len(phase_requests)}... "
+                                  f"(wall: {elapsed_wall:.1f}s, sim: {sim:.1f}s, "
+                                  f"io: {phase_io_time[0]:.1f}s)")
+                        else:
+                            print(f"  Processed {i + 1}/{len(phase_requests)}...")
+            else:
+                completed = [0]
+                completed_lock = threading.Lock()
+
+                def worker(req):
+                    io_t = do_one(req)
+                    with io_time_lock:
+                        phase_io_time[0] += io_t
+                    with completed_lock:
+                        completed[0] += 1
+                        c = completed[0]
+                    if c % 100 == 0:
+                        print(f"  Completed {c}/{len(phase_requests)}...")
+
+                with ThreadPoolExecutor(max_workers=phase_concurrency) as executor:
+                    futures = []
+                    for req in phase_requests:
+                        if replay_timestamps and last_ts is not None:
+                            delta_ms = req.timestamp - last_ts
+                            sleep_time = delta_ms / 1000.0 / time_scale
+                            if sleep_time > 0:
+                                time.sleep(sleep_time)
+                        futures.append(executor.submit(worker, req))
+                        last_ts = req.timestamp
+
+                    for fut in as_completed(futures):
+                        fut.result()
+
+            return time.perf_counter() - t0, phase_io_time[0]
+
+        if mode == 'preload-read':
+            preload_elapsed, _ = execute_phase(
+                base_requests, 'preload', preload_concurrency,
+                phase_label='PRELOAD PHASE')
+            preload_stats = benchmark.get_stats()
+            ps_w = preload_stats['storage']['write']
+            wall_bw = (ps_w['mb'] / preload_elapsed
+                       if preload_elapsed > 0 else 0.0)
+            print(f"  Preload complete: {ps_w['count']:,} writes, "
+                  f"{ps_w['mb']:.1f} MB in {preload_elapsed:.2f}s "
+                  f"({wall_bw:.1f} MB/s wall)")
+
+            # Reset counters so the returned stats reflect READS ONLY.
+            # _written_keys is preserved so cleanup still works.
+            backend.reset_stats()
+            benchmark.reset_stats()
+
+            read_requests = base_requests * read_iterations
+            elapsed, total_io_time = execute_phase(
+                read_requests, 'read', concurrency,
+                phase_label=f'READ PHASE ({read_iterations}x iterations)')
+        else:
+            elapsed, total_io_time = execute_phase(
+                requests, mode, concurrency)
+
         stats = benchmark.get_stats()
 
         if cleanup:
@@ -725,20 +791,29 @@ Sizes may be given as strings like "25GB", "4GB", "512MB".
                              'being released inside MooncakeDistributedStore '
                              'put/get calls.')
     parser.add_argument('--mode', type=str,
-                        choices=['mixed', 'preload', 'read'],
+                        choices=['mixed', 'preload', 'read', 'preload-read'],
                         default='mixed',
                         help='mixed: trace-driven reads+writes (default). '
                              'preload: unconditional writes to fill the '
                              'keyspace. read: pure read phase — never writes, '
-                             'counts misses. Pair preload+read with '
-                             '--stable-key-prefix to share keys across phases.')
+                             'counts misses. preload-read: in a single '
+                             'invocation, preload then switch to read-only '
+                             '(keeps the store connection alive so keys are '
+                             'not GCed between phases).')
     parser.add_argument('--stable-key-prefix', action='store_true',
                         help='Drop the per-pid suffix from the key prefix so '
                              'multiple runs (e.g. preload then read) share '
                              'the same object keys.')
     parser.add_argument('--read-iterations', type=int, default=1,
-                        help='In --mode=read, replay the trace N times to '
+                        help='In --mode=read or --mode=preload-read, replay '
+                             'the trace N times during the read phase to '
                              'collect more read-op samples (default: 1).')
+    parser.add_argument('--preload-concurrency', type=int, default=2,
+                        help='Worker count for the preload phase of '
+                             '--mode=preload-read (default: 2). Kept low to '
+                             'avoid retcode=-200 when the segment pool '
+                             'cannot evict fast enough. --concurrency is '
+                             'still used for the read phase.')
 
     args = parser.parse_args()
 
@@ -746,9 +821,9 @@ Sizes may be given as strings like "25GB", "4GB", "512MB".
         print("Warning: --mode=read without --stable-key-prefix will only "
               "see keys written earlier by THIS process id — usually not "
               "what you want. Did you mean to pass --stable-key-prefix?")
-    if args.read_iterations > 1 and args.mode != 'read':
+    if args.read_iterations > 1 and args.mode not in ('read', 'preload-read'):
         print(f"Warning: --read-iterations={args.read_iterations} is only "
-              "honored in --mode=read; ignored.")
+              "honored in --mode=read or --mode=preload-read; ignored.")
 
     print(f"\n{'='*80}")
     print(f"{'Mooncake KVCache Distributed Store Benchmark':^80}")
@@ -795,6 +870,7 @@ Sizes may be given as strings like "25GB", "4GB", "512MB".
             concurrency=args.concurrency,
             mode=args.mode,
             read_iterations=args.read_iterations,
+            preload_concurrency=args.preload_concurrency,
         ))
 
     if results:
