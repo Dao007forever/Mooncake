@@ -86,6 +86,122 @@ def parse_size(value) -> int:
     return int(float(num) * _SIZE_UNITS[unit])
 
 
+class BufferPool:
+    """Pool of block-sized slots pre-registered with Mooncake for zero-copy
+    RDMA. Allocated once at startup, split across all visible CUDA devices
+    (or as one CPU buffer). Slots are handed out round-robin; there is no
+    explicit release — callers must ensure the pool is large enough that
+    slots don't alias between concurrent in-flight batches."""
+
+    def __init__(self, store, block_size_bytes: int, total_bytes: int,
+                 target: str = 'gpu'):
+        self.block_size_bytes = block_size_bytes
+        self.target = target
+        self._store = store
+        self._lock = threading.Lock()
+        self._cursor = 0
+        self._slots: List[int] = []  # raw uintptr_t values
+        self._regions = []           # keeps tensors/ctypes buffers alive
+        self._region_ptrs: List[int] = []  # for unregister on close
+
+        if target == 'gpu':
+            self._init_gpu(total_bytes)
+        elif target == 'cpu':
+            self._init_cpu(total_bytes)
+        else:
+            raise ValueError(f"Unknown buffer target: {target!r}")
+
+    def _init_gpu(self, total_bytes: int):
+        try:
+            import torch
+        except ImportError as e:
+            raise RuntimeError(
+                "--buffer-target=gpu requires PyTorch. "
+                "Install with: pip install torch") from e
+        if not torch.cuda.is_available():
+            raise RuntimeError(
+                "--buffer-target=gpu requires CUDA, but torch.cuda is "
+                "unavailable on this host.")
+
+        n_gpus = torch.cuda.device_count()
+        per_gpu = total_bytes // n_gpus
+        slots_per_gpu = per_gpu // self.block_size_bytes
+        per_gpu = slots_per_gpu * self.block_size_bytes
+        if slots_per_gpu == 0:
+            raise ValueError(
+                f"--pool-bytes per GPU ({per_gpu:,}) < block size "
+                f"({self.block_size_bytes:,}). Either raise --pool-bytes, "
+                f"use fewer GPUs, or pick a smaller block size (smaller "
+                f"model preset / fewer tokens per block).")
+
+        print(f"  Allocating GPU pool: {n_gpus} GPUs x "
+              f"{per_gpu / 1024**3:.1f} GB = "
+              f"{per_gpu * n_gpus / 1024**3:.1f} GB "
+              f"({slots_per_gpu * n_gpus} slots total, "
+              f"{slots_per_gpu} per GPU)")
+
+        for gpu_id in range(n_gpus):
+            with torch.cuda.device(gpu_id):
+                t = torch.empty(per_gpu, dtype=torch.uint8,
+                                device=f'cuda:{gpu_id}')
+                t.fill_(0x5A)  # non-zero pattern for write phase
+                torch.cuda.synchronize(gpu_id)
+            ret = self._store.register_buffer(t.data_ptr(), per_gpu)
+            if ret != 0:
+                raise RuntimeError(
+                    f"register_buffer failed on cuda:{gpu_id} "
+                    f"(retcode={ret}). GPUDirect RDMA may not be enabled; "
+                    f"check nvidia-peermem kernel module.")
+            self._regions.append(t)
+            self._region_ptrs.append(t.data_ptr())
+            for i in range(slots_per_gpu):
+                self._slots.append(t.data_ptr() + i * self.block_size_bytes)
+
+        print(f"  GPU pool ready: {len(self._slots)} slots")
+
+    def _init_cpu(self, total_bytes: int):
+        import ctypes
+        slots = total_bytes // self.block_size_bytes
+        total_bytes = slots * self.block_size_bytes
+        if slots == 0:
+            raise ValueError(
+                f"--pool-bytes ({total_bytes:,}) < block size "
+                f"({self.block_size_bytes:,}).")
+        buf = (ctypes.c_uint8 * total_bytes)()
+        ptr = ctypes.addressof(buf)
+        ctypes.memset(ptr, 0x5A, total_bytes)
+        ret = self._store.register_buffer(ptr, total_bytes)
+        if ret != 0:
+            raise RuntimeError(f"register_buffer failed: retcode={ret}")
+        self._regions.append(buf)
+        self._region_ptrs.append(ptr)
+        for i in range(slots):
+            self._slots.append(ptr + i * self.block_size_bytes)
+        print(f"  CPU pool ready: {len(self._slots)} slots "
+              f"({total_bytes / 1024**3:.1f} GB)")
+
+    def acquire(self, n: int) -> List[int]:
+        """Return n slot pointers, wrapping around the pool."""
+        L = len(self._slots)
+        with self._lock:
+            start = self._cursor
+            self._cursor = (start + n) % L
+        return [self._slots[(start + i) % L] for i in range(n)]
+
+    def total_slots(self) -> int:
+        return len(self._slots)
+
+    def close(self):
+        for ptr in self._region_ptrs:
+            try:
+                self._store.unregister_buffer(ptr)
+            except Exception:
+                pass
+        self._region_ptrs = []
+        self._regions = []
+        self._slots = []
+
+
 def load_config(config_path: str) -> Dict:
     """Load and validate config.json."""
     with open(config_path, 'r') as f:
@@ -108,11 +224,15 @@ class DistributedStoreBackend:
 
     def __init__(self, config: Dict, bytes_per_token: int,
                  block_size_tokens: int, local_hostname: Optional[str] = None,
-                 key_prefix: str = 'bench'):
+                 key_prefix: str = 'bench',
+                 zero_copy: bool = False,
+                 buffer_target: str = 'cpu',
+                 pool_bytes: int = 0):
         self.block_size_tokens = block_size_tokens
         self.bytes_per_token = bytes_per_token
         self.block_size_bytes = block_size_tokens * bytes_per_token
         self.key_prefix = key_prefix
+        self.zero_copy = zero_copy
 
         # Pre-allocated data buffer — repeating byte pattern (not all zeros) so
         # any on-wire or on-disk compression does not distort measurements.
@@ -158,6 +278,20 @@ class DistributedStoreBackend:
             'read_latencies_ms': [],
             'write_latencies_ms': [],
         }
+
+        # Zero-copy path: allocate a pre-registered buffer pool. Kept alive
+        # for the lifetime of the backend; released in close().
+        self.pool: Optional[BufferPool] = None
+        if self.zero_copy:
+            if pool_bytes <= 0:
+                raise ValueError(
+                    "zero_copy=True requires pool_bytes > 0")
+            print(f"  Initializing {buffer_target.upper()} buffer pool: "
+                  f"{pool_bytes / 1024**3:.1f} GB, "
+                  f"block size {self.block_size_bytes / 1024**2:.1f} MB")
+            self.pool = BufferPool(
+                self.store, self.block_size_bytes, pool_bytes,
+                target=buffer_target)
 
     def _key(self, hash_id: int) -> str:
         return f"{self.key_prefix}:{self.block_size_tokens}:{hash_id}"
@@ -206,6 +340,84 @@ class DistributedStoreBackend:
             self.stats['write_latencies_ms'].append(latency_ms)
         return latency_ms
 
+    def read_batch(self, hash_ids: List[int]) -> tuple:
+        """Zero-copy batched read. Returns (latency_ms, bytes_read, n_miss).
+        One RDMA flight for all hash_ids, scattering into pool slots."""
+        if not self.pool:
+            raise RuntimeError("read_batch requires zero_copy=True")
+        if not hash_ids:
+            return 0.0, 0, 0
+
+        keys = [self._key(h) for h in hash_ids]
+        slots = self.pool.acquire(len(hash_ids))
+        all_buffer_ptrs = [[p] for p in slots]
+        all_sizes = [[self.block_size_bytes] for _ in hash_ids]
+
+        start = time.perf_counter()
+        results = self.store.batch_get_into_multi_buffers(
+            keys, all_buffer_ptrs, all_sizes)
+        latency_ms = (time.perf_counter() - start) * 1000.0
+
+        # Each entry is bytes-read (>0) or negative on error / 0 on miss.
+        bytes_read = 0
+        n_miss = 0
+        for r in results:
+            if r > 0:
+                bytes_read += r
+            else:
+                n_miss += 1
+
+        if bytes_read == 0:
+            # All misses — don't pollute the per-op latency distribution
+            return 0.0, 0, n_miss
+
+        with self._stats_lock:
+            self.stats['read_count'] += 1
+            self.stats['read_bytes'] += bytes_read
+            self.stats['read_latencies_ms'].append(latency_ms)
+        return latency_ms, bytes_read, n_miss
+
+    def write_batch(self, hash_ids: List[int]) -> tuple:
+        """Zero-copy batched write from pool slots. Returns (latency_ms,
+        bytes_written, n_fail)."""
+        if not self.pool:
+            raise RuntimeError("write_batch requires zero_copy=True")
+        if not hash_ids:
+            return 0.0, 0, 0
+
+        keys = [self._key(h) for h in hash_ids]
+        slots = self.pool.acquire(len(hash_ids))
+        all_buffer_ptrs = [[p] for p in slots]
+        all_sizes = [[self.block_size_bytes] for _ in hash_ids]
+
+        start = time.perf_counter()
+        retcodes = self.store.batch_put_from_multi_buffers(
+            keys, all_buffer_ptrs, all_sizes)
+        latency_ms = (time.perf_counter() - start) * 1000.0
+
+        bytes_written = 0
+        n_fail = 0
+        successful_ids = []
+        for h, rc in zip(hash_ids, retcodes):
+            if rc == 0:
+                bytes_written += self.block_size_bytes
+                successful_ids.append(h)
+            else:
+                n_fail += 1
+        if n_fail:
+            print(f"Warning: batch_put_from_multi_buffers had "
+                  f"{n_fail}/{len(retcodes)} failures (first retcode: "
+                  f"{next((rc for rc in retcodes if rc != 0), 0)})")
+
+        if successful_ids:
+            with self._written_lock:
+                self._written_keys.update(successful_ids)
+            with self._stats_lock:
+                self.stats['write_count'] += 1
+                self.stats['write_bytes'] += bytes_written
+                self.stats['write_latencies_ms'].append(latency_ms)
+        return latency_ms, bytes_written, n_fail
+
     def cleanup(self):
         """Best-effort removal of keys written by this run."""
         removed = 0
@@ -236,6 +448,12 @@ class DistributedStoreBackend:
             }
 
     def close(self):
+        if self.pool is not None:
+            try:
+                self.pool.close()
+            except Exception:
+                pass
+            self.pool = None
         try:
             self.store.close()
         except Exception:
@@ -303,6 +521,9 @@ class StoreBenchmark:
 
     def process_request(self, req: KVCacheRequest,
                         mode: str = 'mixed') -> float:
+        if self.backend.zero_copy:
+            return self._process_request_zc(req, mode)
+
         total_latency = 0.0
         local_reads = 0
         local_writes = 0
@@ -336,6 +557,53 @@ class StoreBenchmark:
         with self._lock:
             self.stats['total_requests'] += 1
             self.stats['total_blocks'] += len(req.hash_ids)
+            self.stats['read_blocks'] += local_reads
+            self.stats['write_blocks'] += local_writes
+            self.stats['prefix_hit_blocks'] += local_hits
+            self.stats['read_miss_blocks'] += local_misses
+            self.stats['request_latencies_ms'].append(latency_ms)
+        return latency_ms
+
+    def _process_request_zc(self, req: KVCacheRequest, mode: str) -> float:
+        """Zero-copy path — one batch RDMA call per request (per phase)."""
+        hash_ids = req.hash_ids
+        total_latency = 0.0
+        local_reads = 0
+        local_writes = 0
+        local_hits = 0
+        local_misses = 0
+
+        if mode == 'read':
+            lat, _, n_miss = self.backend.read_batch(hash_ids)
+            total_latency = lat
+            local_reads = len(hash_ids) - n_miss
+            local_misses = n_miss
+        elif mode == 'preload':
+            lat, _, n_fail = self.backend.write_batch(hash_ids)
+            total_latency = lat
+            local_writes = len(hash_ids) - n_fail
+        else:  # mixed — partition, then one batch per side
+            reads_hids, writes_hids = [], []
+            for h in hash_ids:
+                if self.backend.block_exists(h):
+                    reads_hids.append(h)
+                else:
+                    writes_hids.append(h)
+            if reads_hids:
+                lat_r, _, n_miss = self.backend.read_batch(reads_hids)
+                total_latency += lat_r
+                local_reads = len(reads_hids) - n_miss
+                local_hits = local_reads
+                local_misses = n_miss
+            if writes_hids:
+                lat_w, _, n_fail = self.backend.write_batch(writes_hids)
+                total_latency += lat_w
+                local_writes = len(writes_hids) - n_fail
+
+        latency_ms = total_latency if total_latency > 0 else MIN_LATENCY_MS
+        with self._lock:
+            self.stats['total_requests'] += 1
+            self.stats['total_blocks'] += len(hash_ids)
             self.stats['read_blocks'] += local_reads
             self.stats['write_blocks'] += local_writes
             self.stats['prefix_hit_blocks'] += local_hits
@@ -460,7 +728,10 @@ def run_benchmark(trace_path: str, config: Dict, bytes_per_token: int,
                   key_prefix: str, cleanup: bool,
                   concurrency: int = 1, mode: str = 'mixed',
                   read_iterations: int = 1,
-                  preload_concurrency: int = 2) -> Dict:
+                  preload_concurrency: int = 2,
+                  zero_copy: bool = True,
+                  buffer_target: str = 'gpu',
+                  pool_bytes: int = 160 * 1024**3) -> Dict:
     block_size_bytes = block_size_tokens * bytes_per_token
 
     print(f"\n{'='*80}")
@@ -480,6 +751,8 @@ def run_benchmark(trace_path: str, config: Dict, bytes_per_token: int,
     print(f"Key prefix: {key_prefix}")
     print(f"Concurrency: {concurrency} worker(s)")
     print(f"Mode: {mode}")
+    print(f"Zero-copy: {'enabled (' + buffer_target + ' pool, '
+                        f'{pool_bytes / 1024**3:.1f} GB)' if zero_copy else 'disabled'}")
     if mode == 'preload-read':
         print(f"Preload concurrency: {preload_concurrency} worker(s)")
     if mode in ('read', 'preload-read'):
@@ -508,9 +781,29 @@ def run_benchmark(trace_path: str, config: Dict, bytes_per_token: int,
         requests = base_requests
         print(f"Loaded {len(requests)} requests")
 
+    # Pool-sizing sanity check: zero-copy slots are handed out round-robin
+    # without explicit release, so pool_slots must exceed the max possible
+    # in-flight block count to avoid aliasing between concurrent batches.
+    if zero_copy and requests:
+        max_blocks_per_req = max(len(r.hash_ids) for r in requests)
+        block_size_bytes = block_size_tokens * bytes_per_token
+        pool_slots_est = pool_bytes // block_size_bytes
+        effective_conc = max(concurrency, preload_concurrency
+                             if mode == 'preload-read' else 1)
+        needed_slots = effective_conc * max_blocks_per_req
+        if pool_slots_est < needed_slots:
+            print(f"\n  WARNING: pool has ~{pool_slots_est} slots but "
+                  f"concurrency({effective_conc}) x max_blocks_per_req"
+                  f"({max_blocks_per_req}) = {needed_slots} concurrent "
+                  f"blocks in flight. Slots will alias — reads may see "
+                  f"corrupted data mid-flight. Either lower --concurrency, "
+                  f"raise --pool-bytes, or use a smaller block size.\n")
+
     with DistributedStoreBackend(
         config, bytes_per_token, block_size_tokens,
         key_prefix=key_prefix,
+        zero_copy=zero_copy, buffer_target=buffer_target,
+        pool_bytes=pool_bytes,
     ) as backend:
         benchmark = StoreBenchmark(backend)
         io_time_lock = threading.Lock()
@@ -644,6 +937,8 @@ def run_benchmark(trace_path: str, config: Dict, bytes_per_token: int,
         'time_scale': time_scale,
         'bytes_per_token': bytes_per_token,
         'block_size_tokens': block_size_tokens,
+        'zero_copy': zero_copy,
+        'buffer_target': buffer_target,
         **stats,
     }
 
@@ -684,35 +979,51 @@ def print_results(results: List[Dict]):
               f"P95={wr.get('p95_ms', 0):.3f}ms, "
               f"P99={wr.get('p99_ms', 0):.3f}ms")
 
+        op_label = 'batches' if r.get('zero_copy') else 'ops'
         print(f"\n[I/O & Bandwidth]")
         print(f"  Total Read I/O:  {r['storage']['read']['mb']:>10.1f} MB  "
-              f"({r['storage']['read']['count']:,} ops)")
+              f"({r['storage']['read']['count']:,} {op_label})")
         print(f"  Total Write I/O: {r['storage']['write']['mb']:>10.1f} MB  "
-              f"({r['storage']['write']['count']:,} ops)")
+              f"({r['storage']['write']['count']:,} {op_label})")
 
         rd = r['storage']['read']
         wr = r['storage']['write']
-        # Per-op bandwidth = bytes / sum(op latencies). sum = count * avg.
-        read_time_s = rd['count'] * rd.get('avg_ms', 0) / 1000
-        write_time_s = wr['count'] * wr.get('avg_ms', 0) / 1000
-        if read_time_s > 0:
-            print(f"  Read Bandwidth:      "
-                  f"{rd['mb'] / read_time_s:>10.1f} MB/s  "
-                  f"(per-op: {rd['mb']:.1f} MB / {read_time_s:.2f}s)")
-        if write_time_s > 0:
-            print(f"  Write Bandwidth:     "
-                  f"{wr['mb'] / write_time_s:>10.1f} MB/s  "
-                  f"(per-op: {wr['mb']:.1f} MB / {write_time_s:.2f}s)")
-        io_time = r['io_time_s']
-        if io_time > 0:
-            bw = (rd['mb'] + wr['mb']) / io_time
-            print(f"  Aggregate (per-op):  {bw:>10.1f} MB/s  "
-                  f"(over {io_time:.2f}s of summed op time)")
         wall = r['wall_time_s']
+        conc = r.get('concurrency', 1)
+
+        # Per-stream = single-op rate = bytes_per_op / avg_op_latency.
+        # Under concurrency > 1 this is NOT aggregate throughput, because
+        # many ops overlap in wall time. It's the speed one worker sees.
+        if rd.get('avg_ms', 0) > 0 and rd['count'] > 0:
+            per_op_s = rd['avg_ms'] / 1000.0
+            bytes_per_op = (rd['mb'] * 1024 * 1024) / rd['count']
+            per_stream = (bytes_per_op / per_op_s) / (1024 * 1024)
+            print(f"  Read  (per-stream):  {per_stream:>10.1f} MB/s  "
+                  f"(bytes_per_op / avg_latency = single-worker rate)")
+        if wr.get('avg_ms', 0) > 0 and wr['count'] > 0:
+            per_op_s = wr['avg_ms'] / 1000.0
+            bytes_per_op = (wr['mb'] * 1024 * 1024) / wr['count']
+            per_stream = (bytes_per_op / per_op_s) / (1024 * 1024)
+            print(f"  Write (per-stream):  {per_stream:>10.1f} MB/s  "
+                  f"(bytes_per_op / avg_latency = single-worker rate)")
+
+        # Aggregate = total bytes / wall time — true throughput across all
+        # concurrent workers. This is the number to compare to NIC limits.
         if wall > 0:
-            wall_bw = (rd['mb'] + wr['mb']) / wall
-            print(f"  Wall-clock Throughput: {wall_bw:>8.1f} MB/s  "
-                  f"(over {wall:.2f}s wall time, concurrency={r.get('concurrency', 1)})")
+            if rd['count'] > 0:
+                print(f"  Read  (aggregate):   "
+                      f"{rd['mb'] / wall:>10.1f} MB/s  "
+                      f"({rd['mb']:.1f} MB over {wall:.2f}s wall, "
+                      f"concurrency={conc})")
+            if wr['count'] > 0:
+                print(f"  Write (aggregate):   "
+                      f"{wr['mb'] / wall:>10.1f} MB/s  "
+                      f"({wr['mb']:.1f} MB over {wall:.2f}s wall, "
+                      f"concurrency={conc})")
+            if rd['count'] > 0 and wr['count'] > 0:
+                print(f"  Total (aggregate):   "
+                      f"{(rd['mb'] + wr['mb']) / wall:>10.1f} MB/s  "
+                      f"(read+write over wall time)")
 
         print(f"\n[Execution Time]")
         if r.get('timestamp_replay_enabled'):
@@ -814,8 +1125,30 @@ Sizes may be given as strings like "25GB", "4GB", "512MB".
                              'avoid retcode=-200 when the segment pool '
                              'cannot evict fast enough. --concurrency is '
                              'still used for the read phase.')
+    parser.add_argument('--zero-copy', dest='zero_copy',
+                        action=argparse.BooleanOptionalAction, default=True,
+                        help='Zero-copy batched I/O via '
+                             'batch_get_into_multi_buffers + '
+                             'batch_put_from_multi_buffers on pre-registered '
+                             'buffers. One RDMA flight per request. '
+                             'Default: on. Use --no-zero-copy for the '
+                             'legacy bytes path.')
+    parser.add_argument('--buffer-target', type=str,
+                        choices=['gpu', 'cpu'], default='gpu',
+                        help='Where to allocate the registered buffer pool. '
+                             'gpu (default): torch.cuda, split evenly across '
+                             'all visible CUDA devices — realistic vLLM KV '
+                             'cache path; needs GPUDirect RDMA '
+                             '(nvidia-peermem or dmabuf). cpu: host memory.')
+    parser.add_argument('--pool-bytes', type=str, default='160GB',
+                        help='Total size of the pre-registered buffer pool '
+                             '(default: 160GB, spread across all GPUs for '
+                             '--buffer-target=gpu). Must be large enough '
+                             'that concurrency x max_blocks_per_req slots '
+                             'fit without aliasing.')
 
     args = parser.parse_args()
+    args.pool_bytes_parsed = parse_size(args.pool_bytes)
 
     if args.mode == 'read' and not args.stable_key_prefix:
         print("Warning: --mode=read without --stable-key-prefix will only "
@@ -871,6 +1204,9 @@ Sizes may be given as strings like "25GB", "4GB", "512MB".
             mode=args.mode,
             read_iterations=args.read_iterations,
             preload_concurrency=args.preload_concurrency,
+            zero_copy=args.zero_copy,
+            buffer_target=args.buffer_target,
+            pool_bytes=args.pool_bytes_parsed,
         ))
 
     if results:
