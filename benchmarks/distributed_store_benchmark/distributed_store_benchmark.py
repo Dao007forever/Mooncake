@@ -94,7 +94,8 @@ class BufferPool:
     slots don't alias between concurrent in-flight batches."""
 
     def __init__(self, store, block_size_bytes: int, total_bytes: int,
-                 target: str = 'gpu'):
+                 target: str = 'gpu',
+                 gpu_ids: Optional[List[int]] = None):
         self.block_size_bytes = block_size_bytes
         self.target = target
         self._store = store
@@ -103,6 +104,7 @@ class BufferPool:
         self._slots: List[int] = []  # raw uintptr_t values
         self._regions = []           # keeps tensors/ctypes buffers alive
         self._region_ptrs: List[int] = []  # for unregister on close
+        self._gpu_ids = gpu_ids
 
         if target == 'gpu':
             self._init_gpu(total_bytes)
@@ -123,7 +125,13 @@ class BufferPool:
                 "--buffer-target=gpu requires CUDA, but torch.cuda is "
                 "unavailable on this host.")
 
-        n_gpus = torch.cuda.device_count()
+        visible = torch.cuda.device_count()
+        gpu_ids = self._gpu_ids if self._gpu_ids else list(range(visible))
+        for g in gpu_ids:
+            if g < 0 or g >= visible:
+                raise ValueError(
+                    f"--gpu-ids contains {g} but only {visible} GPUs visible")
+        n_gpus = len(gpu_ids)
         per_gpu = total_bytes // n_gpus
         slots_per_gpu = per_gpu // self.block_size_bytes
         per_gpu = slots_per_gpu * self.block_size_bytes
@@ -134,13 +142,13 @@ class BufferPool:
                 f"use fewer GPUs, or pick a smaller block size (smaller "
                 f"model preset / fewer tokens per block).")
 
-        print(f"  Allocating GPU pool: {n_gpus} GPUs x "
+        print(f"  Allocating GPU pool: GPUs {gpu_ids} x "
               f"{per_gpu / 1024**3:.1f} GB = "
               f"{per_gpu * n_gpus / 1024**3:.1f} GB "
               f"({slots_per_gpu * n_gpus} slots total, "
               f"{slots_per_gpu} per GPU)")
 
-        for gpu_id in range(n_gpus):
+        for gpu_id in gpu_ids:
             with torch.cuda.device(gpu_id):
                 t = torch.empty(per_gpu, dtype=torch.uint8,
                                 device=f'cuda:{gpu_id}')
@@ -227,7 +235,8 @@ class DistributedStoreBackend:
                  key_prefix: str = 'bench',
                  zero_copy: bool = False,
                  buffer_target: str = 'cpu',
-                 pool_bytes: int = 0):
+                 pool_bytes: int = 0,
+                 gpu_ids: Optional[List[int]] = None):
         self.block_size_tokens = block_size_tokens
         self.bytes_per_token = bytes_per_token
         self.block_size_bytes = block_size_tokens * bytes_per_token
@@ -291,7 +300,7 @@ class DistributedStoreBackend:
                   f"block size {self.block_size_bytes / 1024**2:.1f} MB")
             self.pool = BufferPool(
                 self.store, self.block_size_bytes, pool_bytes,
-                target=buffer_target)
+                target=buffer_target, gpu_ids=gpu_ids)
 
     def _key(self, hash_id: int) -> str:
         return f"{self.key_prefix}:{self.block_size_tokens}:{hash_id}"
@@ -731,7 +740,8 @@ def run_benchmark(trace_path: str, config: Dict, bytes_per_token: int,
                   preload_concurrency: int = 2,
                   zero_copy: bool = True,
                   buffer_target: str = 'gpu',
-                  pool_bytes: int = 160 * 1024**3) -> Dict:
+                  pool_bytes: int = 160 * 1024**3,
+                  gpu_ids: Optional[List[int]] = None) -> Dict:
     block_size_bytes = block_size_tokens * bytes_per_token
 
     print(f"\n{'='*80}")
@@ -803,7 +813,7 @@ def run_benchmark(trace_path: str, config: Dict, bytes_per_token: int,
         config, bytes_per_token, block_size_tokens,
         key_prefix=key_prefix,
         zero_copy=zero_copy, buffer_target=buffer_target,
-        pool_bytes=pool_bytes,
+        pool_bytes=pool_bytes, gpu_ids=gpu_ids,
     ) as backend:
         benchmark = StoreBenchmark(backend)
         io_time_lock = threading.Lock()
@@ -1146,9 +1156,18 @@ Sizes may be given as strings like "25GB", "4GB", "512MB".
                              '--buffer-target=gpu). Must be large enough '
                              'that concurrency x max_blocks_per_req slots '
                              'fit without aliasing.')
+    parser.add_argument('--gpu-ids', type=str, default=None,
+                        help='Comma-separated CUDA device IDs to allocate '
+                             'the pool on (default: all visible GPUs). '
+                             'Use this to restrict the pool to GPUs that '
+                             'are PCIe-local to your registered RDMA NICs '
+                             '— e.g. --gpu-ids=0,1,2 when device_name has '
+                             '3 NICs.')
 
     args = parser.parse_args()
     args.pool_bytes_parsed = parse_size(args.pool_bytes)
+    args.gpu_ids_parsed = (
+        [int(x) for x in args.gpu_ids.split(',')] if args.gpu_ids else None)
 
     if args.mode == 'read' and not args.stable_key_prefix:
         print("Warning: --mode=read without --stable-key-prefix will only "
@@ -1207,6 +1226,7 @@ Sizes may be given as strings like "25GB", "4GB", "512MB".
             zero_copy=args.zero_copy,
             buffer_target=args.buffer_target,
             pool_bytes=args.pool_bytes_parsed,
+            gpu_ids=args.gpu_ids_parsed,
         ))
 
     if results:
