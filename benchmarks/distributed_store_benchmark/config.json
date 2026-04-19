@@ -1,8 +1,8 @@
 {
   "metadata_server": "http://10.60.1.149:8080/metadata",
   "master_server_address": "10.60.1.149:50051",
-  "global_segment_size": "400GB",
+  "global_segment_size": "600GB",
   "local_buffer_size": "16GB",
   "protocol": "rdma",
-  "device_name": "mlx5_0,mlx5_1,mlx5_3"
+  "device_name": "mlx5_3,mlx5_4"
 }
