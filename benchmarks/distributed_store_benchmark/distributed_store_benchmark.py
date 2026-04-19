@@ -501,11 +501,25 @@ def print_results(results: List[Dict]):
               f"({r['storage']['read']['count']:,} ops)")
         print(f"  Total Write I/O: {r['storage']['write']['mb']:>10.1f} MB  "
               f"({r['storage']['write']['count']:,} ops)")
+
+        rd = r['storage']['read']
+        wr = r['storage']['write']
+        # Per-op bandwidth = bytes / sum(op latencies). sum = count * avg.
+        read_time_s = rd['count'] * rd.get('avg_ms', 0) / 1000
+        write_time_s = wr['count'] * wr.get('avg_ms', 0) / 1000
+        if read_time_s > 0:
+            print(f"  Read Bandwidth:      "
+                  f"{rd['mb'] / read_time_s:>10.1f} MB/s  "
+                  f"(per-op: {rd['mb']:.1f} MB / {read_time_s:.2f}s)")
+        if write_time_s > 0:
+            print(f"  Write Bandwidth:     "
+                  f"{wr['mb'] / write_time_s:>10.1f} MB/s  "
+                  f"(per-op: {wr['mb']:.1f} MB / {write_time_s:.2f}s)")
         io_time = r['io_time_s']
         if io_time > 0:
-            bw = (r['storage']['read']['mb']
-                  + r['storage']['write']['mb']) / io_time
-            print(f"  Effective Bandwidth: {bw:>10.1f} MB/s")
+            bw = (rd['mb'] + wr['mb']) / io_time
+            print(f"  Aggregate Bandwidth: {bw:>10.1f} MB/s  "
+                  f"(over {io_time:.2f}s wall I/O time)")
 
         print(f"\n[Execution Time]")
         if r.get('timestamp_replay_enabled'):
