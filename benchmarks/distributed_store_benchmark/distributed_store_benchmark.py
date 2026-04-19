@@ -18,7 +18,9 @@ import os
 import re
 import socket
 import statistics
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional
@@ -145,6 +147,8 @@ class DistributedStoreBackend:
         # (and so a single benchmark run is idempotent even if the cluster is
         # shared).
         self._written_keys: set = set()
+        self._written_lock = threading.Lock()
+        self._stats_lock = threading.Lock()
 
         self.stats = {
             'read_count': 0,
@@ -162,8 +166,9 @@ class DistributedStoreBackend:
         # Local cache check first — avoids a round-trip for keys this client
         # already wrote in this run. For cross-run prefix reuse, the store
         # itself is authoritative.
-        if hash_id in self._written_keys:
-            return True
+        with self._written_lock:
+            if hash_id in self._written_keys:
+                return True
         try:
             return bool(self.store.is_exist(self._key(hash_id)))
         except Exception:
@@ -178,9 +183,10 @@ class DistributedStoreBackend:
         if n == 0:
             # Miss — don't pollute latency stats with a failed fetch
             return 0.0
-        self.stats['read_count'] += 1
-        self.stats['read_bytes'] += n
-        self.stats['read_latencies_ms'].append(latency_ms)
+        with self._stats_lock:
+            self.stats['read_count'] += 1
+            self.stats['read_bytes'] += n
+            self.stats['read_latencies_ms'].append(latency_ms)
         return latency_ms
 
     def write_block(self, hash_id: int) -> float:
@@ -192,22 +198,27 @@ class DistributedStoreBackend:
         if retcode != 0:
             print(f"Warning: put failed for key {key} (retcode={retcode})")
             return 0.0
-        self._written_keys.add(hash_id)
-        self.stats['write_count'] += 1
-        self.stats['write_bytes'] += len(data)
-        self.stats['write_latencies_ms'].append(latency_ms)
+        with self._written_lock:
+            self._written_keys.add(hash_id)
+        with self._stats_lock:
+            self.stats['write_count'] += 1
+            self.stats['write_bytes'] += len(data)
+            self.stats['write_latencies_ms'].append(latency_ms)
         return latency_ms
 
     def cleanup(self):
         """Best-effort removal of keys written by this run."""
         removed = 0
-        for hash_id in list(self._written_keys):
+        with self._written_lock:
+            keys_to_remove = list(self._written_keys)
+        for hash_id in keys_to_remove:
             try:
                 if self.store.remove(self._key(hash_id)) == 0:
                     removed += 1
             except Exception:
                 pass
-        self._written_keys.clear()
+        with self._written_lock:
+            self._written_keys.clear()
         return removed
 
     def close(self):
@@ -223,18 +234,28 @@ class DistributedStoreBackend:
             return {'avg_ms': statistics.mean(latencies),
                     **calc_percentiles(latencies)}
 
+        with self._stats_lock:
+            reads = list(self.stats['read_latencies_ms'])
+            writes = list(self.stats['write_latencies_ms'])
+            read_count = self.stats['read_count']
+            write_count = self.stats['write_count']
+            read_bytes = self.stats['read_bytes']
+            write_bytes = self.stats['write_bytes']
+        with self._written_lock:
+            total_blocks = len(self._written_keys)
+
         return {
             'read': {
-                'count': self.stats['read_count'],
-                'mb': self.stats['read_bytes'] / 1024 / 1024,
-                **calc(self.stats['read_latencies_ms']),
+                'count': read_count,
+                'mb': read_bytes / 1024 / 1024,
+                **calc(reads),
             },
             'write': {
-                'count': self.stats['write_count'],
-                'mb': self.stats['write_bytes'] / 1024 / 1024,
-                **calc(self.stats['write_latencies_ms']),
+                'count': write_count,
+                'mb': write_bytes / 1024 / 1024,
+                **calc(writes),
             },
-            'total_blocks': len(self._written_keys),
+            'total_blocks': total_blocks,
         }
 
     def __enter__(self):
@@ -255,6 +276,7 @@ class StoreBenchmark:
     def __init__(self, backend: DistributedStoreBackend):
         self.backend = backend
         self.block_size_tokens = backend.block_size_tokens
+        self._lock = threading.Lock()
         self.stats = {
             'total_requests': 0,
             'total_blocks': 0,
@@ -265,41 +287,52 @@ class StoreBenchmark:
         }
 
     def process_request(self, req: KVCacheRequest) -> float:
-        self.stats['total_requests'] += 1
-        self.stats['total_blocks'] += len(req.hash_ids)
         total_latency = 0.0
+        local_reads = 0
+        local_writes = 0
+        local_hits = 0
 
         for hash_id in req.hash_ids:
             if self.backend.block_exists(hash_id):
                 total_latency += self.backend.read_block(hash_id)
-                self.stats['read_blocks'] += 1
-                self.stats['prefix_hit_blocks'] += 1
+                local_reads += 1
+                local_hits += 1
             else:
                 total_latency += self.backend.write_block(hash_id)
-                self.stats['write_blocks'] += 1
+                local_writes += 1
 
         latency_ms = total_latency if total_latency > 0 else MIN_LATENCY_MS
-        self.stats['request_latencies_ms'].append(latency_ms)
+        with self._lock:
+            self.stats['total_requests'] += 1
+            self.stats['total_blocks'] += len(req.hash_ids)
+            self.stats['read_blocks'] += local_reads
+            self.stats['write_blocks'] += local_writes
+            self.stats['prefix_hit_blocks'] += local_hits
+            self.stats['request_latencies_ms'].append(latency_ms)
         return latency_ms
 
     def get_stats(self) -> Dict:
         storage_stats = self.backend.get_stats()
-        rl = self.stats['request_latencies_ms']
+        with self._lock:
+            rl = list(self.stats['request_latencies_ms'])
+            total_requests = self.stats['total_requests']
+            total = self.stats['total_blocks']
+            reads = self.stats['read_blocks']
+            writes = self.stats['write_blocks']
+            prefix_hits = self.stats['prefix_hit_blocks']
+
         if rl:
             latency_stats = {'avg_ms': statistics.mean(rl),
                              **calc_percentiles(rl)}
         else:
             latency_stats = {'avg_ms': 0, 'p50_ms': 0, 'p95_ms': 0, 'p99_ms': 0}
 
-        total = self.stats['total_blocks']
-        reads = self.stats['read_blocks']
-        writes = self.stats['write_blocks']
         return {
-            'total_requests': self.stats['total_requests'],
+            'total_requests': total_requests,
             'total_blocks': total,
             'read_blocks': reads,
             'write_blocks': writes,
-            'prefix_hit_blocks': self.stats['prefix_hit_blocks'],
+            'prefix_hit_blocks': prefix_hits,
             'block_hit_rate': reads / total if total else 0,
             'write_ratio': writes / total if total else 0,
             'tokens_per_block': self.block_size_tokens,
@@ -378,7 +411,8 @@ class TraceLoader:
 def run_benchmark(trace_path: str, config: Dict, bytes_per_token: int,
                   max_requests: Optional[int], block_size_tokens: int,
                   replay_timestamps: bool, time_scale: float,
-                  key_prefix: str, cleanup: bool) -> Dict:
+                  key_prefix: str, cleanup: bool,
+                  concurrency: int = 1) -> Dict:
     block_size_bytes = block_size_tokens * bytes_per_token
 
     print(f"\n{'='*80}")
@@ -396,10 +430,14 @@ def run_benchmark(trace_path: str, config: Dict, bytes_per_token: int,
           f"({block_size_bytes:,} bytes)")
     print(f"Bytes per token: {bytes_per_token}")
     print(f"Key prefix: {key_prefix}")
+    print(f"Concurrency: {concurrency} worker(s)")
     print(f"Timestamp replay: "
           f"{'Enabled' if replay_timestamps else 'Disabled'}")
     if replay_timestamps:
         print(f"Time scale: {time_scale}x")
+    if concurrency > 1 and replay_timestamps:
+        print("  Warning: --replay-timestamps + --concurrency>1 — arrival "
+              "rate is bounded by the trace, extra workers may idle")
     print(f"{'='*80}")
 
     requests = TraceLoader(trace_path).get_requests()
@@ -413,32 +451,69 @@ def run_benchmark(trace_path: str, config: Dict, bytes_per_token: int,
     ) as backend:
         benchmark = StoreBenchmark(backend)
 
+        def do_request(req):
+            req_start = time.perf_counter()
+            benchmark.process_request(req)
+            return time.perf_counter() - req_start
+
         start_time = time.perf_counter()
         total_io_time = 0.0
+        io_time_lock = threading.Lock()
         last_timestamp = None
         base_time = time.time()
 
-        for i, req in enumerate(requests):
-            if replay_timestamps and last_timestamp is not None:
-                delta_ms = req.timestamp - last_timestamp
-                sleep_time = delta_ms / 1000.0 / time_scale
-                if sleep_time > 0:
-                    time.sleep(sleep_time)
+        if concurrency <= 1:
+            # Serial path — preserves original behavior and progress output.
+            for i, req in enumerate(requests):
+                if replay_timestamps and last_timestamp is not None:
+                    delta_ms = req.timestamp - last_timestamp
+                    sleep_time = delta_ms / 1000.0 / time_scale
+                    if sleep_time > 0:
+                        time.sleep(sleep_time)
 
-            req_start = time.perf_counter()
-            benchmark.process_request(req)
-            total_io_time += time.perf_counter() - req_start
-            last_timestamp = req.timestamp
+                total_io_time += do_request(req)
+                last_timestamp = req.timestamp
 
-            if (i + 1) % 100 == 0:
-                if replay_timestamps:
-                    elapsed = time.time() - base_time
-                    sim = (req.timestamp - requests[0].timestamp) / 1000.0 / time_scale
-                    print(f"  Processed {i + 1}/{len(requests)}... "
-                          f"(wall: {elapsed:.1f}s, sim: {sim:.1f}s, "
-                          f"io: {total_io_time:.1f}s)")
-                else:
-                    print(f"  Processed {i + 1}/{len(requests)}...")
+                if (i + 1) % 100 == 0:
+                    if replay_timestamps:
+                        elapsed_wall = time.time() - base_time
+                        sim = (req.timestamp - requests[0].timestamp) / 1000.0 / time_scale
+                        print(f"  Processed {i + 1}/{len(requests)}... "
+                              f"(wall: {elapsed_wall:.1f}s, sim: {sim:.1f}s, "
+                              f"io: {total_io_time:.1f}s)")
+                    else:
+                        print(f"  Processed {i + 1}/{len(requests)}...")
+        else:
+            # Concurrent path — N worker threads, producer respects replay
+            # pacing between submissions but execution is async.
+            completed = 0
+            completed_lock = threading.Lock()
+
+            def worker(req):
+                io_t = do_request(req)
+                with io_time_lock:
+                    nonlocal total_io_time
+                    total_io_time += io_t
+                with completed_lock:
+                    nonlocal completed
+                    completed += 1
+                    c = completed
+                if c % 100 == 0:
+                    print(f"  Completed {c}/{len(requests)}...")
+
+            with ThreadPoolExecutor(max_workers=concurrency) as executor:
+                futures = []
+                for req in requests:
+                    if replay_timestamps and last_timestamp is not None:
+                        delta_ms = req.timestamp - last_timestamp
+                        sleep_time = delta_ms / 1000.0 / time_scale
+                        if sleep_time > 0:
+                            time.sleep(sleep_time)
+                    futures.append(executor.submit(worker, req))
+                    last_timestamp = req.timestamp
+
+                for fut in as_completed(futures):
+                    fut.result()  # surface exceptions
 
         elapsed = time.perf_counter() - start_time
         stats = benchmark.get_stats()
@@ -447,14 +522,28 @@ def run_benchmark(trace_path: str, config: Dict, bytes_per_token: int,
             removed = backend.cleanup()
             print(f"Cleanup: removed {removed} keys")
 
-    io_time = total_io_time if replay_timestamps else elapsed
+    # For aggregate throughput, wall time is the honest denominator when
+    # concurrency > 1 (real parallelism) or replay is off. Only in serial +
+    # replay do we want to exclude sleep time by using sum of per-op times.
+    if replay_timestamps and concurrency <= 1:
+        io_time = total_io_time
+    else:
+        io_time = elapsed
+
+    total_bytes = (stats['storage']['read']['mb']
+                   + stats['storage']['write']['mb']) * 1024 * 1024
+    aggregate_bw_mb_s = (total_bytes / elapsed / 1024 / 1024
+                         if elapsed > 0 else 0)
+
     return {
         'trace_file': Path(trace_path).name,
         'total_requests': len(requests),
         'simulation_time_s': elapsed,
         'io_time_s': io_time,
         'wall_time_s': elapsed,
-        'requests_per_second': len(requests) / io_time if io_time > 0 else 0,
+        'requests_per_second': len(requests) / elapsed if elapsed > 0 else 0,
+        'aggregate_bandwidth_mb_s': aggregate_bw_mb_s,
+        'concurrency': concurrency,
         'timestamp_replay_enabled': replay_timestamps,
         'time_scale': time_scale,
         'bytes_per_token': bytes_per_token,
@@ -470,6 +559,7 @@ def print_results(results: List[Dict]):
         print(f"{'='*80}")
 
         print(f"\n[Performance Overview]")
+        print(f"  Concurrency:              {r.get('concurrency', 1)}")
         print(f"  Total Requests:           {r['total_requests']:,}")
         print(f"  Queries Per Second (QPS): {r['requests_per_second']:.2f}")
         print(f"  Cache Hit Rate:           {r['block_hit_rate']:.2%}")
@@ -518,8 +608,13 @@ def print_results(results: List[Dict]):
         io_time = r['io_time_s']
         if io_time > 0:
             bw = (rd['mb'] + wr['mb']) / io_time
-            print(f"  Aggregate Bandwidth: {bw:>10.1f} MB/s  "
-                  f"(over {io_time:.2f}s wall I/O time)")
+            print(f"  Aggregate (per-op):  {bw:>10.1f} MB/s  "
+                  f"(over {io_time:.2f}s of summed op time)")
+        wall = r['wall_time_s']
+        if wall > 0:
+            wall_bw = (rd['mb'] + wr['mb']) / wall
+            print(f"  Wall-clock Throughput: {wall_bw:>8.1f} MB/s  "
+                  f"(over {wall:.2f}s wall time, concurrency={r.get('concurrency', 1)})")
 
         print(f"\n[Execution Time]")
         if r.get('timestamp_replay_enabled'):
@@ -591,6 +686,12 @@ Sizes may be given as strings like "25GB", "4GB", "512MB".
                         help='Prefix applied to every object key')
     parser.add_argument('--no-cleanup', action='store_true',
                         help='Skip removing keys written during the run')
+    parser.add_argument('--concurrency', type=int, default=1,
+                        help='Number of parallel request workers (default: 1 '
+                             '= serial). Raising this saturates multi-rail '
+                             'RDMA; real parallelism comes from the GIL '
+                             'being released inside MooncakeDistributedStore '
+                             'put/get calls.')
 
     args = parser.parse_args()
 
@@ -631,6 +732,7 @@ Sizes may be given as strings like "25GB", "4GB", "512MB".
             args.replay_timestamps, args.time_scale,
             f"{key_prefix}:{scenario}",
             cleanup=not args.no_cleanup,
+            concurrency=args.concurrency,
         ))
 
     if results:
