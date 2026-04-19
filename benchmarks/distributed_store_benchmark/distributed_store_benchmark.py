@@ -283,23 +283,40 @@ class StoreBenchmark:
             'read_blocks': 0,
             'write_blocks': 0,
             'prefix_hit_blocks': 0,
+            'read_miss_blocks': 0,
             'request_latencies_ms': [],
         }
 
-    def process_request(self, req: KVCacheRequest) -> float:
+    def process_request(self, req: KVCacheRequest,
+                        mode: str = 'mixed') -> float:
         total_latency = 0.0
         local_reads = 0
         local_writes = 0
         local_hits = 0
+        local_misses = 0
 
         for hash_id in req.hash_ids:
-            if self.backend.block_exists(hash_id):
-                total_latency += self.backend.read_block(hash_id)
-                local_reads += 1
-                local_hits += 1
-            else:
+            if mode == 'read':
+                # Pure-read: always attempt a fetch, count misses, never write.
+                lat = self.backend.read_block(hash_id)
+                if lat > 0:
+                    total_latency += lat
+                    local_reads += 1
+                else:
+                    local_misses += 1
+            elif mode == 'preload':
+                # Preload: unconditionally write, ignore existing state so the
+                # keyspace fills deterministically across runs.
                 total_latency += self.backend.write_block(hash_id)
                 local_writes += 1
+            else:  # mixed
+                if self.backend.block_exists(hash_id):
+                    total_latency += self.backend.read_block(hash_id)
+                    local_reads += 1
+                    local_hits += 1
+                else:
+                    total_latency += self.backend.write_block(hash_id)
+                    local_writes += 1
 
         latency_ms = total_latency if total_latency > 0 else MIN_LATENCY_MS
         with self._lock:
@@ -308,6 +325,7 @@ class StoreBenchmark:
             self.stats['read_blocks'] += local_reads
             self.stats['write_blocks'] += local_writes
             self.stats['prefix_hit_blocks'] += local_hits
+            self.stats['read_miss_blocks'] += local_misses
             self.stats['request_latencies_ms'].append(latency_ms)
         return latency_ms
 
@@ -320,6 +338,7 @@ class StoreBenchmark:
             reads = self.stats['read_blocks']
             writes = self.stats['write_blocks']
             prefix_hits = self.stats['prefix_hit_blocks']
+            read_misses = self.stats['read_miss_blocks']
 
         if rl:
             latency_stats = {'avg_ms': statistics.mean(rl),
@@ -333,6 +352,7 @@ class StoreBenchmark:
             'read_blocks': reads,
             'write_blocks': writes,
             'prefix_hit_blocks': prefix_hits,
+            'read_miss_blocks': read_misses,
             'block_hit_rate': reads / total if total else 0,
             'write_ratio': writes / total if total else 0,
             'tokens_per_block': self.block_size_tokens,
@@ -412,7 +432,8 @@ def run_benchmark(trace_path: str, config: Dict, bytes_per_token: int,
                   max_requests: Optional[int], block_size_tokens: int,
                   replay_timestamps: bool, time_scale: float,
                   key_prefix: str, cleanup: bool,
-                  concurrency: int = 1) -> Dict:
+                  concurrency: int = 1, mode: str = 'mixed',
+                  read_iterations: int = 1) -> Dict:
     block_size_bytes = block_size_tokens * bytes_per_token
 
     print(f"\n{'='*80}")
@@ -431,6 +452,9 @@ def run_benchmark(trace_path: str, config: Dict, bytes_per_token: int,
     print(f"Bytes per token: {bytes_per_token}")
     print(f"Key prefix: {key_prefix}")
     print(f"Concurrency: {concurrency} worker(s)")
+    print(f"Mode: {mode}")
+    if mode == 'read':
+        print(f"Read iterations: {read_iterations}")
     print(f"Timestamp replay: "
           f"{'Enabled' if replay_timestamps else 'Disabled'}")
     if replay_timestamps:
@@ -440,10 +464,16 @@ def run_benchmark(trace_path: str, config: Dict, bytes_per_token: int,
               "rate is bounded by the trace, extra workers may idle")
     print(f"{'='*80}")
 
-    requests = TraceLoader(trace_path).get_requests()
+    base_requests = TraceLoader(trace_path).get_requests()
     if max_requests:
-        requests = requests[:max_requests]
-    print(f"Loaded {len(requests)} requests")
+        base_requests = base_requests[:max_requests]
+    if mode == 'read' and read_iterations > 1:
+        requests = base_requests * read_iterations
+        print(f"Loaded {len(base_requests)} requests "
+              f"(replaying {read_iterations}x = {len(requests)} total)")
+    else:
+        requests = base_requests
+        print(f"Loaded {len(requests)} requests")
 
     with DistributedStoreBackend(
         config, bytes_per_token, block_size_tokens,
@@ -453,7 +483,7 @@ def run_benchmark(trace_path: str, config: Dict, bytes_per_token: int,
 
         def do_request(req):
             req_start = time.perf_counter()
-            benchmark.process_request(req)
+            benchmark.process_request(req, mode=mode)
             return time.perf_counter() - req_start
 
         start_time = time.perf_counter()
@@ -568,6 +598,8 @@ def print_results(results: List[Dict]):
         print(f"    Read Blocks:            {r['read_blocks']:,}")
         print(f"    Write Blocks:           {r['write_blocks']:,}")
         print(f"    Prefix Hits:            {r['prefix_hit_blocks']:,}")
+        if r.get('read_miss_blocks', 0):
+            print(f"    Read Misses:            {r['read_miss_blocks']:,}")
 
         print(f"\n[Latency Analysis]")
         rl = r['latency']
@@ -692,8 +724,31 @@ Sizes may be given as strings like "25GB", "4GB", "512MB".
                              'RDMA; real parallelism comes from the GIL '
                              'being released inside MooncakeDistributedStore '
                              'put/get calls.')
+    parser.add_argument('--mode', type=str,
+                        choices=['mixed', 'preload', 'read'],
+                        default='mixed',
+                        help='mixed: trace-driven reads+writes (default). '
+                             'preload: unconditional writes to fill the '
+                             'keyspace. read: pure read phase — never writes, '
+                             'counts misses. Pair preload+read with '
+                             '--stable-key-prefix to share keys across phases.')
+    parser.add_argument('--stable-key-prefix', action='store_true',
+                        help='Drop the per-pid suffix from the key prefix so '
+                             'multiple runs (e.g. preload then read) share '
+                             'the same object keys.')
+    parser.add_argument('--read-iterations', type=int, default=1,
+                        help='In --mode=read, replay the trace N times to '
+                             'collect more read-op samples (default: 1).')
 
     args = parser.parse_args()
+
+    if args.mode == 'read' and not args.stable_key_prefix:
+        print("Warning: --mode=read without --stable-key-prefix will only "
+              "see keys written earlier by THIS process id — usually not "
+              "what you want. Did you mean to pass --stable-key-prefix?")
+    if args.read_iterations > 1 and args.mode != 'read':
+        print(f"Warning: --read-iterations={args.read_iterations} is only "
+              "honored in --mode=read; ignored.")
 
     print(f"\n{'='*80}")
     print(f"{'Mooncake KVCache Distributed Store Benchmark':^80}")
@@ -709,8 +764,13 @@ Sizes may be given as strings like "25GB", "4GB", "512MB".
     else:
         print(f"Using custom bytes_per_token: {bytes_per_token}")
 
-    # Use a per-run key prefix so concurrent clients don't collide.
-    key_prefix = f"{args.key_prefix}:{os.getpid()}"
+    # By default, use a per-run key prefix so concurrent clients don't
+    # collide. --stable-key-prefix drops the pid suffix so preload/read
+    # phases can share keys.
+    if args.stable_key_prefix:
+        key_prefix = args.key_prefix
+    else:
+        key_prefix = f"{args.key_prefix}:{os.getpid()}"
 
     scenarios = (['conversation', 'synthetic', 'toolagent']
                  if args.scenario == 'all' else [args.scenario])
@@ -733,6 +793,8 @@ Sizes may be given as strings like "25GB", "4GB", "512MB".
             f"{key_prefix}:{scenario}",
             cleanup=not args.no_cleanup,
             concurrency=args.concurrency,
+            mode=args.mode,
+            read_iterations=args.read_iterations,
         ))
 
     if results:
