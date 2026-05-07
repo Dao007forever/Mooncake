@@ -311,22 +311,28 @@ if ((${#ACTIVE_LABELS[@]} == 0)); then
   exit 1
 fi
 
-sleep "$WINDOW"
+while true; do
+  sleep "$WINDOW"
+  echo "=================================="
+  echo "== $(date '+%Y-%m-%d %H:%M:%S') =="
 
-for i in "${!ACTIVE_LABELS[@]}"; do
-  label=${ACTIVE_LABELS[$i]}
-  counter_path=${COUNTER_PATHS[$i]}
-  before=${BEFORE[$i]}
-  multiplier=${MULTIPLIERS[$i]}
-  after=$(<"$counter_path")
+  for i in "${!ACTIVE_LABELS[@]}"; do
+    label=${ACTIVE_LABELS[$i]}
+    counter_path=${COUNTER_PATHS[$i]}
+    before=${BEFORE[$i]}
+    multiplier=${MULTIPLIERS[$i]}
+    after=$(<"$counter_path")
 
-  if [[ ! "$after" =~ ^[0-9]+$ ]]; then
-    echo "Skipping $label: counter value is not numeric after sampling: $counter_path" >&2
-    continue
-  fi
+    if [[ ! "$after" =~ ^[0-9]+$ ]]; then
+      echo "Skipping $label: counter value is not numeric after sampling: $counter_path" >&2
+      continue
+    fi
 
-  python3 -c 'import sys
+    python3 -c 'import sys
 dev, after, before, window, multiplier = sys.argv[1], int(sys.argv[2]), int(sys.argv[3]), float(sys.argv[4]), int(sys.argv[5])
 print(f"{dev} rcv_rate: {(after - before) * multiplier / window / 1e9:.1f} GB/s")' \
-    "$label" "$after" "$before" "$WINDOW" "$multiplier"
+      "$label" "$after" "$before" "$WINDOW" "$multiplier"
+
+    BEFORE[$i]=$after
+  done
 done
