@@ -117,10 +117,18 @@ add_roce_netdev() {
   ROCE_NETDEVS+=("$ndev")
 }
 
+add_roce_netdev_from_file() {
+  local ndev_file=$1
+  local ndev
+
+  ndev=$(cat "$ndev_file" 2>/dev/null || true)
+  ndev=${ndev%%$'\n'*}
+  add_roce_netdev "$ndev"
+}
+
 collect_roce_netdevs() {
   local d=$1
   local dev_net_dir
-  local ndev
   local ndev_dir
   local ndev_file
   local net_path
@@ -136,14 +144,12 @@ collect_roce_netdevs() {
   if [[ -n "$GID_INDEX" ]]; then
     ndev_file="$ndev_dir/$GID_INDEX"
     if [[ -r "$ndev_file" ]]; then
-      read -r ndev <"$ndev_file"
-      add_roce_netdev "$ndev"
+      add_roce_netdev_from_file "$ndev_file"
     fi
   elif [[ -d "$ndev_dir" ]]; then
     for ndev_file in "$ndev_dir"/*; do
       [[ -r "$ndev_file" ]] || continue
-      read -r ndev <"$ndev_file"
-      add_roce_netdev "$ndev"
+      add_roce_netdev_from_file "$ndev_file"
     done
   fi
 
