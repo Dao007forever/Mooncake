@@ -5,6 +5,7 @@ usage() {
   echo "Usage: $0 [window_seconds] [device ...]" >&2
   echo "       DEVS=mlx5_0,mlx5_1 $0 [window_seconds]" >&2
   echo "       MODE=auto|roce|ib PORT=1 GID_INDEX=3 $0 [window_seconds] [device ...]" >&2
+  echo "       PORT defaults to all ports; set PORT=1 to restrict it." >&2
 }
 
 WINDOW=${WINDOW:-5}
@@ -29,7 +30,7 @@ if [[ ! "$WINDOW" =~ ^[0-9]+([.][0-9]+)?$ ]] ||
   exit 2
 fi
 
-PORT=${PORT:-1}
+PORT=${PORT:-}
 MODE=${MODE:-auto}
 GID_INDEX=${GID_INDEX:-}
 IB_COUNTER=${IB_COUNTER:-${COUNTER:-port_rcv_data}}
@@ -49,6 +50,12 @@ esac
 
 if [[ -n "$GID_INDEX" && ! "$GID_INDEX" =~ ^[0-9]+$ ]]; then
   echo "GID_INDEX must be a non-negative integer: $GID_INDEX" >&2
+  usage
+  exit 2
+fi
+
+if [[ -n "$PORT" && ! "$PORT" =~ ^[0-9]+$ ]]; then
+  echo "PORT must be a non-negative integer: $PORT" >&2
   usage
   exit 2
 fi
@@ -126,11 +133,64 @@ add_roce_netdev_from_file() {
   add_roce_netdev "$ndev"
 }
 
+collect_roce_netdevs_from_port() {
+  local d=$1
+  local port=$2
+  local ndev_dir
+  local ndev_file
+
+  ndev_dir="$SYSFS_INFINIBAND/$d/ports/$port/gid_attrs/ndevs"
+  if [[ -n "$GID_INDEX" ]]; then
+    ndev_file="$ndev_dir/$GID_INDEX"
+    [[ -r "$ndev_file" ]] && add_roce_netdev_from_file "$ndev_file"
+    return 0
+  fi
+
+  if [[ -d "$ndev_dir" ]]; then
+    for ndev_file in "$ndev_dir"/*; do
+      [[ -r "$ndev_file" ]] || continue
+      add_roce_netdev_from_file "$ndev_file"
+    done
+  fi
+
+  return 0
+}
+
+collect_roce_netdevs_from_rdma() {
+  local d=$1
+  local port_dir
+
+  if [[ -n "$PORT" ]]; then
+    collect_roce_netdevs_from_port "$d" "$PORT"
+    return 0
+  fi
+
+  if [[ -d "$SYSFS_INFINIBAND/$d/ports" ]]; then
+    for port_dir in "$SYSFS_INFINIBAND/$d/ports"/*; do
+      [[ -d "$port_dir" ]] || continue
+      collect_roce_netdevs_from_port "$d" "${port_dir##*/}"
+    done
+  fi
+}
+
+collect_roce_netdevs_from_net() {
+  local d=$1
+  local ib_path
+  local net_path
+
+  for net_path in "$SYSFS_NET"/*; do
+    [[ -d "$net_path" ]] || continue
+    [[ -r "$net_path/statistics/$NET_COUNTER" ]] || continue
+    for ib_path in "$net_path"/device/infiniband/*; do
+      [[ -e "$ib_path" ]] || continue
+      [[ "${ib_path##*/}" == "$d" ]] && add_roce_netdev "${net_path##*/}"
+    done
+  done
+}
+
 collect_roce_netdevs() {
   local d=$1
   local dev_net_dir
-  local ndev_dir
-  local ndev_file
   local net_path
 
   ROCE_NETDEVS=()
@@ -140,18 +200,7 @@ collect_roce_netdevs() {
     return 0
   fi
 
-  ndev_dir="$SYSFS_INFINIBAND/$d/ports/$PORT/gid_attrs/ndevs"
-  if [[ -n "$GID_INDEX" ]]; then
-    ndev_file="$ndev_dir/$GID_INDEX"
-    if [[ -r "$ndev_file" ]]; then
-      add_roce_netdev_from_file "$ndev_file"
-    fi
-  elif [[ -d "$ndev_dir" ]]; then
-    for ndev_file in "$ndev_dir"/*; do
-      [[ -r "$ndev_file" ]] || continue
-      add_roce_netdev_from_file "$ndev_file"
-    done
-  fi
+  collect_roce_netdevs_from_rdma "$d"
 
   dev_net_dir="$SYSFS_INFINIBAND/$d/device/net"
   if [[ -d "$dev_net_dir" ]]; then
@@ -160,6 +209,8 @@ collect_roce_netdevs() {
       add_roce_netdev "${net_path##*/}"
     done
   fi
+
+  collect_roce_netdevs_from_net "$d"
 
   return 0
 }
@@ -176,7 +227,11 @@ add_roce_samples() {
 
   if ((${#ROCE_NETDEVS[@]} == 0)); then
     if ((quiet == 0)); then
-      echo "Skipping $d: no RoCE netdev mapping found for port $PORT" >&2
+      if [[ -n "$PORT" ]]; then
+        echo "Skipping $d: no RoCE netdev mapping found for port $PORT" >&2
+      else
+        echo "Skipping $d: no RoCE netdev mapping found" >&2
+      fi
     fi
     return 1
   fi
@@ -194,7 +249,24 @@ add_roce_samples() {
 
 add_ib_sample() {
   local d=$1
-  add_sample "$d" "$SYSFS_INFINIBAND/$d/ports/$PORT/counters/$IB_COUNTER" 4 "InfiniBand"
+  local added=1
+  local port_dir
+  local port
+
+  if [[ -n "$PORT" ]]; then
+    add_sample "$d" "$SYSFS_INFINIBAND/$d/ports/$PORT/counters/$IB_COUNTER" 4 "InfiniBand"
+    return $?
+  fi
+
+  if [[ -d "$SYSFS_INFINIBAND/$d/ports" ]]; then
+    for port_dir in "$SYSFS_INFINIBAND/$d/ports"/*; do
+      [[ -d "$port_dir" ]] || continue
+      port=${port_dir##*/}
+      add_sample "$d/port$port" "$port_dir/counters/$IB_COUNTER" 4 "InfiniBand" && added=0
+    done
+  fi
+
+  return "$added"
 }
 
 for d in "${DEVS[@]}"; do
@@ -216,12 +288,23 @@ done
 if ((${#ACTIVE_LABELS[@]} == 0)); then
   echo "No readable receive counters found." >&2
   echo "Searched RoCE counters under $SYSFS_NET/<netdev>/statistics/$NET_COUNTER" >&2
-  echo "Searched InfiniBand counters under $SYSFS_INFINIBAND/<dev>/ports/$PORT/counters/$IB_COUNTER" >&2
+  if [[ -n "$PORT" ]]; then
+    echo "Searched InfiniBand counters under $SYSFS_INFINIBAND/<dev>/ports/$PORT/counters/$IB_COUNTER" >&2
+  else
+    echo "Searched InfiniBand counters under $SYSFS_INFINIBAND/<dev>/ports/<port>/counters/$IB_COUNTER" >&2
+  fi
   if [[ -d "$SYSFS_INFINIBAND" ]]; then
     echo "Available RDMA devices under $SYSFS_INFINIBAND:" >&2
     for dev_path in "$SYSFS_INFINIBAND"/*; do
       [[ -e "$dev_path" ]] || continue
       echo "  ${dev_path##*/}" >&2
+    done
+  fi
+  if [[ -d "$SYSFS_NET" ]]; then
+    echo "Available netdev counters under $SYSFS_NET:" >&2
+    for net_path in "$SYSFS_NET"/*; do
+      [[ -r "$net_path/statistics/$NET_COUNTER" ]] || continue
+      echo "  ${net_path##*/}" >&2
     done
   fi
   usage
