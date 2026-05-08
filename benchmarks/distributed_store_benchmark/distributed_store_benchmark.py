@@ -741,7 +741,8 @@ def run_benchmark(trace_path: str, config: Dict, bytes_per_token: int,
                   zero_copy: bool = True,
                   buffer_target: str = 'gpu',
                   pool_bytes: int = 160 * 1024**3,
-                  gpu_ids: Optional[List[int]] = None) -> Dict:
+                  gpu_ids: Optional[List[int]] = None,
+                  hold_after_run: float = 0.0) -> Dict:
     block_size_bytes = block_size_tokens * bytes_per_token
 
     print(f"\n{'='*80}")
@@ -767,6 +768,8 @@ def run_benchmark(trace_path: str, config: Dict, bytes_per_token: int,
         print(f"Preload concurrency: {preload_concurrency} worker(s)")
     if mode in ('read', 'preload-read'):
         print(f"Read iterations: {read_iterations}")
+    if hold_after_run > 0:
+        print(f"Hold after run: {hold_after_run:g} seconds")
     print(f"Timestamp replay: "
           f"{'Enabled' if replay_timestamps else 'Disabled'}")
     if replay_timestamps:
@@ -920,6 +923,13 @@ def run_benchmark(trace_path: str, config: Dict, bytes_per_token: int,
         if cleanup:
             removed = backend.cleanup()
             print(f"Cleanup: removed {removed} keys")
+        if hold_after_run > 0:
+            print(f"Holding store open for {hold_after_run:g} seconds. "
+                  "Press Ctrl-C to exit early.")
+            try:
+                time.sleep(hold_after_run)
+            except KeyboardInterrupt:
+                print("Hold interrupted; closing store.")
 
     # For aggregate throughput, wall time is the honest denominator when
     # concurrency > 1 (real parallelism) or replay is off. Only in serial +
@@ -1105,6 +1115,11 @@ Sizes may be given as strings like "25GB", "4GB", "512MB".
                         help='Prefix applied to every object key')
     parser.add_argument('--no-cleanup', action='store_true',
                         help='Skip removing keys written during the run')
+    parser.add_argument('--hold-after-run', type=float, default=0.0,
+                        help='Keep the Mooncake client open for N seconds '
+                             'after the benchmark phases finish. Useful for '
+                             'preload writers that must keep their RAM segment '
+                             'mounted while a separate reader process runs.')
     parser.add_argument('--concurrency', type=int, default=1,
                         help='Number of parallel request workers (default: 1 '
                              '= serial). Raising this saturates multi-rail '
@@ -1227,6 +1242,7 @@ Sizes may be given as strings like "25GB", "4GB", "512MB".
             buffer_target=args.buffer_target,
             pool_bytes=args.pool_bytes_parsed,
             gpu_ids=args.gpu_ids_parsed,
+            hold_after_run=args.hold_after_run,
         ))
 
     if results:
