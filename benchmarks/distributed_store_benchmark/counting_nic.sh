@@ -33,11 +33,12 @@ fi
 PORT=${PORT:-}
 MODE=${MODE:-auto}
 GID_INDEX=${GID_INDEX:-}
-IB_COUNTER=${IB_COUNTER:-${COUNTER:-port_rcv_data}}
+IB_COUNTER=${IB_COUNTER:-${COUNTER:-}}
 NET_COUNTER=${NET_COUNTER:-rx_bytes}
 SYSFS_INFINIBAND=${SYSFS_INFINIBAND:-/sys/class/infiniband}
 SYSFS_NET=${SYSFS_NET:-/sys/class/net}
 USER_DEVS=${DEVS:-}
+IB_COUNTERS=()
 
 case "$MODE" in
   auto | roce | ib) ;;
@@ -58,6 +59,14 @@ if [[ -n "$PORT" && ! "$PORT" =~ ^[0-9]+$ ]]; then
   echo "PORT must be a non-negative integer: $PORT" >&2
   usage
   exit 2
+fi
+
+if [[ -n "$IB_COUNTER" ]]; then
+  IB_COUNTERS=("$IB_COUNTER")
+elif [[ -n "${COUNTERS:-}" ]]; then
+  read -r -a IB_COUNTERS <<< "${COUNTERS//,/ }"
+else
+  IB_COUNTERS=(port_rcv_data port_xmit_data)
 fi
 
 DEVS=()
@@ -81,16 +90,34 @@ if ((${#DEVS[@]} == 0)); then
 fi
 
 ACTIVE_LABELS=()
+ACTIVE_RATE_NAMES=()
 COUNTER_PATHS=()
 BEFORE=()
 MULTIPLIERS=()
 ROCE_NETDEVS=()
+
+rate_name_for_counter() {
+  local counter=$1
+
+  case "$counter" in
+    port_rcv_data | rx_bytes)
+      echo "rcv_rate"
+      ;;
+    port_xmit_data | tx_bytes)
+      echo "xmit_rate"
+      ;;
+    *)
+      echo "${counter}_rate"
+      ;;
+  esac
+}
 
 add_sample() {
   local label=$1
   local counter_path=$2
   local multiplier=$3
   local source=$4
+  local rate_name=$5
   local before
 
   if [[ ! -r "$counter_path" ]]; then
@@ -105,6 +132,7 @@ add_sample() {
   fi
 
   ACTIVE_LABELS+=("$label")
+  ACTIVE_RATE_NAMES+=("$rate_name")
   COUNTER_PATHS+=("$counter_path")
   BEFORE+=("$before")
   MULTIPLIERS+=("$multiplier")
@@ -241,7 +269,7 @@ add_roce_samples() {
     if [[ "$ndev" != "$d" ]]; then
       label="$d/$ndev"
     fi
-    add_sample "$label" "$SYSFS_NET/$ndev/statistics/$NET_COUNTER" 1 "RoCE" || true
+    add_sample "$label" "$SYSFS_NET/$ndev/statistics/$NET_COUNTER" 1 "RoCE" "$(rate_name_for_counter "$NET_COUNTER")" || true
   done
 
   ((${#ACTIVE_LABELS[@]} > before_count))
@@ -252,17 +280,31 @@ add_ib_sample() {
   local added=1
   local port_dir
   local port
+  local counter
+  local label
 
   if [[ -n "$PORT" ]]; then
-    add_sample "$d" "$SYSFS_INFINIBAND/$d/ports/$PORT/counters/$IB_COUNTER" 4 "InfiniBand"
-    return $?
+    for counter in "${IB_COUNTERS[@]}"; do
+      label="$d"
+      if ((${#IB_COUNTERS[@]} > 1)); then
+        label="$d/$counter"
+      fi
+      add_sample "$label" "$SYSFS_INFINIBAND/$d/ports/$PORT/counters/$counter" 4 "InfiniBand" "$(rate_name_for_counter "$counter")" && added=0
+    done
+    return "$added"
   fi
 
   if [[ -d "$SYSFS_INFINIBAND/$d/ports" ]]; then
     for port_dir in "$SYSFS_INFINIBAND/$d/ports"/*; do
       [[ -d "$port_dir" ]] || continue
       port=${port_dir##*/}
-      add_sample "$d/port$port" "$port_dir/counters/$IB_COUNTER" 4 "InfiniBand" && added=0
+      for counter in "${IB_COUNTERS[@]}"; do
+        label="$d/port$port"
+        if ((${#IB_COUNTERS[@]} > 1)); then
+          label="$label/$counter"
+        fi
+        add_sample "$label" "$port_dir/counters/$counter" 4 "InfiniBand" "$(rate_name_for_counter "$counter")" && added=0
+      done
     done
   fi
 
@@ -286,12 +328,12 @@ for d in "${DEVS[@]}"; do
 done
 
 if ((${#ACTIVE_LABELS[@]} == 0)); then
-  echo "No readable receive counters found." >&2
+  echo "No readable counters found." >&2
   echo "Searched RoCE counters under $SYSFS_NET/<netdev>/statistics/$NET_COUNTER" >&2
   if [[ -n "$PORT" ]]; then
-    echo "Searched InfiniBand counters under $SYSFS_INFINIBAND/<dev>/ports/$PORT/counters/$IB_COUNTER" >&2
+    echo "Searched InfiniBand counters under $SYSFS_INFINIBAND/<dev>/ports/$PORT/counters/{${IB_COUNTERS[*]}}" >&2
   else
-    echo "Searched InfiniBand counters under $SYSFS_INFINIBAND/<dev>/ports/<port>/counters/$IB_COUNTER" >&2
+    echo "Searched InfiniBand counters under $SYSFS_INFINIBAND/<dev>/ports/<port>/counters/{${IB_COUNTERS[*]}}" >&2
   fi
   if [[ -d "$SYSFS_INFINIBAND" ]]; then
     echo "Available RDMA devices under $SYSFS_INFINIBAND:" >&2
@@ -318,6 +360,7 @@ while true; do
 
   for i in "${!ACTIVE_LABELS[@]}"; do
     label=${ACTIVE_LABELS[$i]}
+    rate_name=${ACTIVE_RATE_NAMES[$i]}
     counter_path=${COUNTER_PATHS[$i]}
     before=${BEFORE[$i]}
     multiplier=${MULTIPLIERS[$i]}
@@ -329,9 +372,9 @@ while true; do
     fi
 
     python3 -c 'import sys
-dev, after, before, window, multiplier = sys.argv[1], int(sys.argv[2]), int(sys.argv[3]), float(sys.argv[4]), int(sys.argv[5])
-print(f"{dev} rcv_rate: {(after - before) * multiplier / window / 1e9:.1f} GB/s")' \
-      "$label" "$after" "$before" "$WINDOW" "$multiplier"
+dev, rate_name, after, before, window, multiplier = sys.argv[1], sys.argv[2], int(sys.argv[3]), int(sys.argv[4]), float(sys.argv[5]), int(sys.argv[6])
+print(f"{dev} {rate_name}: {(after - before) * multiplier / window / 1e9:.1f} GB/s")' \
+      "$label" "$rate_name" "$after" "$before" "$WINDOW" "$multiplier"
 
     BEFORE[$i]=$after
   done
