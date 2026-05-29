@@ -1067,7 +1067,7 @@ class MasterService {
         UUID holder_id;  // owner of source LOCAL_DISK; only Notifier allowed
     };
 
-    static constexpr size_t kNumShards = 1024;  // Number of metadata shards
+    static constexpr size_t kNumShards = 8192;  // Number of metadata shards
 
     // Sharded metadata maps and their mutexes
     struct MetadataShard {
