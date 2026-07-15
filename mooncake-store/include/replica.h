@@ -91,7 +91,9 @@ struct ReplicateConfig {
         preferred_nof_segments{};  // Preferred NoF segments for allocation
     bool prefer_alloc_in_same_node{false};
     ObjectDataType data_type{ObjectDataType::UNKNOWN};
-    std::string host_id{};
+    // Added after the initial RPC wire layout. Keep this compatible so clients
+    // built before host-aware allocation can still send ReplicateConfig.
+    struct_pack::compatible<std::string, 20260702> host_id{};
     // Optional per-key routing group IDs. Empty string keeps that key
     // ungrouped. Grouped keys share metadata routing, coalesced lease refresh,
     // and memory eviction behavior.
@@ -131,8 +133,8 @@ struct ReplicateConfig {
         os << ", prefer_alloc_in_same_node: "
            << config.prefer_alloc_in_same_node
            << ", data_type: " << config.data_type;
-        if (!config.host_id.empty()) {
-            os << ", host_id: " << config.host_id;
+        if (config.host_id.has_value() && !config.host_id->empty()) {
+            os << ", host_id: " << *config.host_id;
         }
         if (config.group_ids.has_value()) {
             os << ", group_ids: [";

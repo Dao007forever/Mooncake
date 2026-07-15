@@ -2872,8 +2872,10 @@ auto MasterService::AllocateAndInsertMetadata(
             config.replica_num == 1;
         std::string writer_host_id;
         if (use_local_first) {
-            writer_host_id = config.host_id.empty() ? GetClientHostId(client_id)
-                                                    : config.host_id;
+            writer_host_id =
+                !config.host_id.has_value() || config.host_id->empty()
+                    ? GetClientHostId(client_id)
+                    : *config.host_id;
         }
 
         ScopedAllocatorAccess allocator_access =
@@ -3087,7 +3089,7 @@ auto MasterService::PutStart(const UUID& client_id, const std::string& key,
     }
 #endif
 
-    UpdateClientHostId(client_id, config.host_id);
+    UpdateClientHostId(client_id, config.host_id.value_or(std::string{}));
 
     if ((memory_allocator_type_ == BufferAllocatorType::CACHELIB) &&
         (slice_length > kMaxSliceSize)) {
@@ -3519,7 +3521,7 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
     }
 #endif
 
-    UpdateClientHostId(client_id, config.host_id);
+    UpdateClientHostId(client_id, config.host_id.value_or(std::string{}));
 
     if ((memory_allocator_type_ == BufferAllocatorType::CACHELIB) &&
         (slice_length > kMaxSliceSize)) {
