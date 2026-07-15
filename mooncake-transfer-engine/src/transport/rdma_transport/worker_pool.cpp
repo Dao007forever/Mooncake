@@ -92,7 +92,9 @@ WorkerPool::WorkerPool(RdmaContext &context, int numa_socket_id)
       parked_worker_count_(0),
       redispatch_counter_(0),
       submitted_slice_count_(0),
-      processed_slice_count_(0) {
+      processed_slice_count_(0),
+      health_tracker_(
+          [] { return static_cast<uint64_t>(getCurrentTimeInNano()); }) {
     for (int i = 0; i < kShardCount; ++i)
         slice_queue_count_[i].store(0, std::memory_order_relaxed);
     collective_slice_queue_.resize(kTransferWorkerCount);
@@ -152,6 +154,7 @@ int WorkerPool::submitPostSend(
     SliceList slice_list_map[kShardCount];
     uint64_t submitted_slice_count = 0;
     int all_rails_failed_count = 0;
+    std::unordered_set<std::string> all_rails_failed_peers;
     thread_local std::unordered_map<int, uint64_t> failed_target_ids;
     for (auto &slice : slice_list) {
         if (failed_target_ids.count(slice->target_id)) {
@@ -223,6 +226,8 @@ int WorkerPool::submitPostSend(
             if (!found) {
                 slice->markFailed();  // All rails unavailable
                 all_rails_failed_count++;
+                all_rails_failed_peers.insert(
+                    peer_segment_desc->nicPathServerName());
                 continue;
             }
         }
@@ -265,14 +270,53 @@ int WorkerPool::submitPostSend(
     }
 
     // Context-level health tracking: if all slices failed due to no available
-    // rails, increment the context failure counter. This detects catastrophic
-    // local RNIC hardware failure where all paths through the RNIC are down.
+    // rails, record the failure (with the set of peers it targeted) toward the
+    // context breaker. The breaker only trips when the failure streak spans
+    // multiple distinct peers -- a batch targets a single peer, so a streak
+    // against one dead/restarting peer is a peer problem, not evidence of
+    // local RNIC failure.
     if (submitted_slice_count == 0 &&
         all_rails_failed_count == (int)slice_list.size()) {
-        markContextFailure();
+        markContextFailure(all_rails_failed_peers);
     }
 
     return 0;
+}
+
+void WorkerPool::markContextFailure(
+    const std::unordered_set<std::string> &failed_peers) {
+    // Deactivation happens inside the tracker mutex, atomically with the
+    // trip, so it cannot interleave with PORT_ACTIVE's reset + reactivation
+    // on the monitor thread (which would strand the context inactive with no
+    // armed trip and therefore no TTL recovery).
+    auto rec =
+        health_tracker_.recordFailure(failed_peers, kContextFailureThreshold,
+                                      globalConfig().context_failure_min_peers,
+                                      [this] { context_.set_active(false); });
+    if (rec.tripped_now) {
+        LOG(WARNING) << "Context breaker tripped: context "
+                     << context_.deviceName() << " pausing after " << rec.streak
+                     << " consecutive all-rails-failed batches spanning "
+                     << rec.distinct_peers << " distinct peers ["
+                     << rec.peer_sample << "], pause_ttl_ms="
+                     << globalConfig().context_pause_ttl_ms;
+    }
+}
+
+void WorkerPool::maybeReactivateContext() {
+    int ttl_ms = globalConfig().context_pause_ttl_ms;
+    if (ttl_ms <= 0) return;  // 0 = legacy latch-until-PORT_ACTIVE
+    // Reactivation runs inside the tracker mutex, atomically with clearing
+    // the trip: performPostSend never sees an active context that the
+    // !contextHealthy() drain would still fast-fail, and no async-event flag
+    // flip can interleave between the clear and the reactivation.
+    if (health_tracker_.tryReactivate(
+            static_cast<uint64_t>(ttl_ms) * 1000000ull,
+            [this] { context_.set_active(true); })) {
+        LOG(INFO) << "Context breaker pause expired: context "
+                  << context_.deviceName()
+                  << " reactivating (half-open, streak reset)";
+    }
 }
 
 void WorkerPool::trackPostedSlices(
@@ -727,7 +771,12 @@ int WorkerPool::doProcessContextEvents() {
                event.event_type == IBV_EVENT_WQ_FATAL ||
                event.event_type == IBV_EVENT_PORT_ERR ||
                event.event_type == IBV_EVENT_LID_CHANGE) {
-        context_.set_active(false);
+        // The async event now owns this context's inactive state: clear the
+        // breaker (so its TTL reactivation cannot resurrect a context that a
+        // DEVICE_FATAL/PORT_ERR took down -- recovery is
+        // IBV_EVENT_PORT_ACTIVE only) and deactivate, atomically with respect
+        // to a concurrent submitter-thread trip.
+        onFatalEventDeactivate();
         refreshPublishedLocalTopology();
 
         /**
@@ -762,9 +811,14 @@ int WorkerPool::doProcessContextEvents() {
                       << ", disconnected all endpoints";
         }
     } else if (event.event_type == IBV_EVENT_PORT_ACTIVE) {
-        context_.set_active(true);
+        // Full breaker reset on port recovery (clears streak AND any armed
+        // trip, cancelling a pending TTL reactivation) plus reactivation, as
+        // one atomic transition: a concurrent submitter-thread trip cannot
+        // interleave its set_active(false) between our reset and flag flip,
+        // which would strand the context inactive with no armed trip and no
+        // TTL recovery.
+        onPortActiveReactivate();
         refreshPublishedLocalTopology();
-        markContextSuccess();  // Reset failure counter on port recovery
         LOG(INFO) << "Worker: Context " << context_.deviceName()
                   << " is now active";
     }
@@ -836,6 +890,9 @@ void WorkerPool::monitorWorker() {
             // Drop expired active-connect pause entries so the map doesn't grow
             // for peers that are never re-attempted after their pause lapses.
             context_.pruneConnectPause();
+            // Half-open recovery for the context breaker: reactivate the
+            // context once its pause TTL has elapsed.
+            maybeReactivateContext();
             last_reset_ts = current_ts;
         }
 

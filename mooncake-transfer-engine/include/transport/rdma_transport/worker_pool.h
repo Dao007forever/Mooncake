@@ -20,6 +20,7 @@
 
 #include "config.h"
 #include "rdma_context.h"
+#include "transport/rdma_transport/context_health_tracker.h"
 
 namespace mooncake {
 class WorkerPool {
@@ -70,23 +71,36 @@ class WorkerPool {
     void refreshPublishedLocalTopology();
     GidRefreshResult refreshPublishedLocalGid();
 
-    // Context-level health tracking for catastrophic hardware failure.
-    // When all rails through a local RNIC are unavailable, increment the
-    // failure counter. Reset on any success. Mark context inactive after
-    // consecutive failures exceed threshold.
-    bool contextHealthy() const {
-        return context_failure_count_ < kContextFailureThreshold;
+    // Context-level circuit breaker for catastrophic local RNIC failure.
+    // State lives in ContextHealthTracker. The breaker trips only when the
+    // consecutive all-rails-failed streak spans at least
+    // MC_CONTEXT_FAILURE_MIN_PEERS distinct peer servers (a streak against a
+    // single dead peer must never deactivate the local context), and it
+    // auto-reactivates (half-open) after MC_CONTEXT_PAUSE_TTL_MS from the
+    // monitor tick. Fatal async events reset the tracker so the TTL can never
+    // resurrect an event-deactivated context.
+    //
+    // Every (tripped, context-active) transition -- submitter-thread trips,
+    // monitor-thread TTL reactivation, and the async-event handlers below --
+    // updates context_.set_active() inside the tracker mutex, so the flag can
+    // never diverge from the trip state. Without that, a trip's
+    // set_active(false) interleaving with PORT_ACTIVE's set_active(true) +
+    // reset() could leave the context inactive with no armed trip: TTL
+    // recovery would never run and the context would be skipped forever.
+    bool contextHealthy() const { return !health_tracker_.tripped(); }
+    void markContextSuccess() { health_tracker_.recordSuccess(); }
+    void markContextFailure(
+        const std::unordered_set<std::string> &failed_peers);
+    void maybeReactivateContext();
+    // Fatal async event owns the inactive state: clear the breaker (cancels
+    // any pending TTL reactivation) and deactivate, atomically.
+    void onFatalEventDeactivate() {
+        health_tracker_.reset([this] { context_.set_active(false); });
     }
-    void markContextSuccess() { context_failure_count_ = 0; }
-    void markContextFailure() {
-        context_failure_count_++;
-        if (context_failure_count_ >= kContextFailureThreshold) {
-            LOG(WARNING) << "All rails failed for context "
-                         << context_.deviceName() << " for "
-                         << context_failure_count_
-                         << " consecutive attempts, marking inactive";
-            context_.set_active(false);
-        }
+    // PORT_ACTIVE recovery: clear the breaker (streak AND any armed trip)
+    // and reactivate, atomically.
+    void onPortActiveReactivate() {
+        health_tracker_.reset([this] { context_.set_active(true); });
     }
 
    private:
@@ -133,8 +147,8 @@ class WorkerPool {
     const static int kRailErrorThreshold = 5;            // Errors before pause
     const static uint64_t kRailPauseNs = 1000000000ull;  // 1 second pause
 
-    // Context-level health tracking
-    int context_failure_count_ = 0;
+    // Context-level circuit breaker (see markContextFailure above)
+    ContextHealthTracker health_tracker_;
     const static int kContextFailureThreshold =
         32;  // consecutive all-rails-failed
 };
