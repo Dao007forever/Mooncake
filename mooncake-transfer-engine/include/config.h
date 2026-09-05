@@ -91,25 +91,12 @@ struct GlobalConfig {
     // not-yet-posted slices fail/redispatch instead of hanging. 0 disables.
     // Override via MC_CONN_PAUSE_TTL_MS.
     int conn_pause_ttl_ms = 0;
-    // Context-level circuit-breaker pause. When the WorkerPool breaker trips
-    // (kContextFailureThreshold consecutive all-rails-failed submit batches
-    // spanning >= context_failure_min_peers distinct peers), the local RNIC
-    // context is deactivated for this many milliseconds and then automatically
-    // reactivated (half-open: the failure streak resets, so a genuinely dead
-    // NIC re-trips after another threshold's worth of failed batches while a
-    // false positive self-heals). 0 = never auto-reactivate, i.e. the legacy
-    // latch that only IBV_EVENT_PORT_ACTIVE clears. Override via
-    // MC_CONTEXT_PAUSE_TTL_MS.
+    // Context-level circuit-breaker pause. Repeated local WC failures
+    // deactivate the local RNIC context for this many milliseconds. The
+    // monitor then reactivates it with a reset failure count. Must be positive
+    // so a breaker trip cannot recreate the legacy permanent latch. Override
+    // via MC_CONTEXT_PAUSE_TTL_MS.
     int context_pause_ttl_ms = 5000;
-    // Minimum number of DISTINCT peer servers a consecutive all-rails-failed
-    // submit streak must span before the context breaker may trip. A submit
-    // batch targets a single peer, so a streak against one dead/restarting
-    // peer is a peer problem, not evidence of local RNIC failure, and must
-    // never deactivate the context. Direct local completion faults remain
-    // strong local evidence and are not subject to this minimum. 1 = legacy
-    // single-peer submit tripping. Range [1, 64]. Override via
-    // MC_CONTEXT_FAILURE_MIN_PEERS.
-    int context_failure_min_peers = 2;
     uint16_t rpc_min_port = 15000;
     uint16_t rpc_max_port = 17000;
     bool use_ipv6 = false;

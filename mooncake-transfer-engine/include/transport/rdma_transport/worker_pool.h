@@ -25,7 +25,6 @@
 
 #include "config.h"
 #include "rdma_context.h"
-#include "transport/rdma_transport/context_health_tracker.h"
 
 namespace mooncake {
 class WorkerPoolTestPeer;
@@ -111,42 +110,16 @@ class WorkerPool {
 
     bool tryHandoffToAnotherLocalWorker(Transport::Slice *slice);
 
-    // Context-level circuit breaker for catastrophic local RNIC failure.
-    // State lives in one ContextHealthTracker with separate submit-side and
-    // local-completion evidence channels. The submit streak must span at least
-    // MC_CONTEXT_FAILURE_MIN_PEERS distinct peer servers (a streak against a
-    // single dead peer must never deactivate the local context). Direct local
-    // completion faults remain strong local evidence and do not require
-    // multiple peers, but cannot inherit submit-side evidence. Either channel
-    // may trip the one coordinated breaker. A trip auto-reactivates (half-open)
-    // after MC_CONTEXT_PAUSE_TTL_MS from the monitor tick. Fatal async events
-    // reset both channels so the TTL can never resurrect an event-deactivated
-    // context.
-    //
-    // Every breaker-driven context-active transition -- submitter-thread
-    // trips, monitor-thread TTL reactivation, and physical-event recovery --
-    // updates context_.set_active() inside the tracker mutex, so the flag can
-    // never diverge from the trip state. Without that, a trip's
-    // set_active(false) interleaving with recovery's set_active(true) + reset()
-    // could leave the context inactive with no armed trip: TTL recovery would
-    // never run and the context would be skipped forever.
-    bool contextHealthy() const { return !health_tracker_.tripped(); }
-    void markContextSuccess() { health_tracker_.recordSuccess(); }
-    bool markContextFailure(ContextHealthTracker::FailureSource source,
-                            const std::unordered_set<std::string> &failed_peers,
-                            int failure_threshold, int min_peers,
-                            const char *failure_kind);
+    // Only direct local completion errors charge the context breaker.
+    // Submit-side all-rails-unavailable failures remain peer/rail scoped.
+    bool markLocalContextFailure();
+    void markContextSuccess();
+    bool tryReactivateContext(uint64_t now_ns);
     void maybeReactivateContext();
-    // Fatal async event owns the inactive state: clear the breaker (cancels
-    // any pending TTL reactivation) and deactivate, atomically.
-    void onFatalEventDeactivate() {
-        health_tracker_.reset([this] { context_.set_active(false); });
-    }
-    // Successful delayed port recovery: clear the breaker (streak AND any
-    // armed trip) and reactivate, atomically.
-    void onRecoveredContextActivate() {
-        health_tracker_.reset([this] { context_.set_active(true); });
-    }
+    // Serialize breaker transitions with physical-event recovery so a late
+    // completion cannot arm TTL recovery after a fatal event.
+    void resetContextBreaker(bool context_active);
+    void clearContextBreaker();
 
    private:
     RdmaContext &context_;
@@ -194,9 +167,11 @@ class WorkerPool {
     const static uint64_t kContextRecoveryDelayNs =
         30000000000ull;  // 30 seconds before a recovered local RNIC is reused
 
-    // Context-level circuit breaker (see markContextFailure above)
-    ContextHealthTracker health_tracker_;
-    static constexpr int kSubmitFailureThreshold = 32;
+    // Local-completion context breaker. Protected by context_state_lock_ so
+    // fatal events, GID recovery and TTL recovery have one state owner.
+    std::mutex context_state_lock_;
+    std::atomic<int> context_failure_count_{0};
+    uint64_t breaker_reactivate_after_ns_{0};
     static constexpr int kLocalCompletionFailureThreshold = 32;
 };
 }  // namespace mooncake

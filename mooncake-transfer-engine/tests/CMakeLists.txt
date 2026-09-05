@@ -48,10 +48,9 @@ target_link_libraries(rdma_endpoint_state_test PUBLIC transfer_engine gtest
                                                       gtest_main)
 add_test(NAME rdma_endpoint_state_test COMMAND rdma_endpoint_state_test)
 
-# Regression test for the reconnect storm of issue #3299: repeated local
-# completion faults toward one peer RNIC must pause that path instead of
-# re-handshaking it forever. The rail monitor is plain per-worker-pool state, so
-# this runs on every CI runner without an RDMA device.
+# Hardware-free regression tests for peer-rail pausing and the local-WC context
+# breaker. Both are plain per-worker-pool state, so this runs on every CI runner
+# without an RDMA device.
 add_executable(worker_pool_rail_state_test
                ${WORKSPACE}/worker_pool_rail_state_test.cpp)
 target_link_libraries(worker_pool_rail_state_test PUBLIC transfer_engine gtest
@@ -191,15 +190,6 @@ add_executable(connect_pause_tracker_test
 target_link_libraries(connect_pause_tracker_test PUBLIC gtest gtest_main
                                                         pthread)
 add_test(NAME connect_pause_tracker_test COMMAND connect_pause_tracker_test)
-
-# Hardware-free unit test for the context-level circuit-breaker state
-# (ContextHealthTracker is header-only and clock-injectable), runs on every CI
-# runner.
-add_executable(context_health_tracker_test
-               ${WORKSPACE}/context_health_tracker_test.cpp)
-target_link_libraries(context_health_tracker_test PUBLIC gtest gtest_main
-                                                         pthread)
-add_test(NAME context_health_tracker_test COMMAND context_health_tracker_test)
 
 # Hardware-free unit tests for DmabufExport struct and
 # RdmaContext::{exportDmabuf, closeDmabufExport}. Runs on every CI runner — no

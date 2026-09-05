@@ -19,8 +19,9 @@
 // fault turned into a reconnect storm. markRailFailed() now counts those
 // faults, and kRailErrorThreshold consecutive ones pause the path.
 //
-// The rail monitor is plain per-worker-pool state, so these tests need no RDMA
-// device: the pool is built over a context whose device never opens.
+// The rail monitor and local-WC context breaker are plain per-worker-pool
+// state, so these tests need no RDMA device: the pool is built over a context
+// whose device never opens.
 
 #include <gtest/gtest.h>
 
@@ -94,6 +95,49 @@ class WorkerPoolTestPeer {
     static int errorThreshold() { return WorkerPool::kRailErrorThreshold; }
 
     static uint64_t errorWindowNs() { return WorkerPool::kRailErrorWindowNs; }
+
+    static void setContextActive(WorkerPool &pool, bool active) {
+        pool.context_.set_active(active);
+    }
+
+    static bool contextActive(WorkerPool &pool) {
+        return pool.context_.active();
+    }
+
+    static bool markLocalContextFailure(WorkerPool &pool) {
+        return pool.markLocalContextFailure();
+    }
+
+    static void markContextSuccess(WorkerPool &pool) {
+        pool.markContextSuccess();
+    }
+
+    static int contextFailureCount(WorkerPool &pool) {
+        return pool.context_failure_count_.load(std::memory_order_relaxed);
+    }
+
+    static uint64_t breakerReactivateAfter(WorkerPool &pool) {
+        std::lock_guard<std::mutex> lock(pool.context_state_lock_);
+        return pool.breaker_reactivate_after_ns_;
+    }
+
+    static bool tryReactivateContext(WorkerPool &pool, uint64_t now_ns) {
+        return pool.tryReactivateContext(now_ns);
+    }
+
+    static void setRecoveryActivateAfter(WorkerPool &pool,
+                                         uint64_t activate_after_ns) {
+        pool.recovery_activate_after_ns_.store(activate_after_ns,
+                                               std::memory_order_relaxed);
+    }
+
+    static void resetContextBreaker(WorkerPool &pool, bool context_active) {
+        pool.resetContextBreaker(context_active);
+    }
+
+    static int contextFailureThreshold() {
+        return WorkerPool::kLocalCompletionFailureThreshold;
+    }
 };
 
 }  // namespace mooncake
@@ -200,6 +244,100 @@ TEST_F(WorkerPoolRailStateTest, RailsArePausedIndependently) {
 
     EXPECT_FALSE(railAvailable(kPeerA));
     EXPECT_TRUE(railAvailable(kPeerB));
+}
+
+// Peer/rail failures stay scoped to that path and never charge the local
+// context breaker. This is the incident shape: one restarting peer must not
+// remove a healthy local RNIC from service.
+TEST_F(WorkerPoolRailStateTest, PeerRailFailuresDoNotDeactivateContext) {
+    WorkerPoolTestPeer::setContextActive(*worker_pool_, true);
+    for (int i = 0; i < WorkerPoolTestPeer::contextFailureThreshold(); ++i)
+        failRail(kPeerA, /*immediate_pause=*/true);
+
+    EXPECT_TRUE(WorkerPoolTestPeer::contextActive(*worker_pool_));
+    EXPECT_EQ(WorkerPoolTestPeer::contextFailureCount(*worker_pool_), 0);
+}
+
+TEST_F(WorkerPoolRailStateTest, LocalFailuresTripContextAtThreshold) {
+    WorkerPoolTestPeer::setContextActive(*worker_pool_, true);
+    const int threshold = WorkerPoolTestPeer::contextFailureThreshold();
+    for (int i = 0; i < threshold - 1; ++i) {
+        EXPECT_FALSE(
+            WorkerPoolTestPeer::markLocalContextFailure(*worker_pool_));
+        EXPECT_TRUE(WorkerPoolTestPeer::contextActive(*worker_pool_));
+    }
+
+    EXPECT_TRUE(WorkerPoolTestPeer::markLocalContextFailure(*worker_pool_));
+    EXPECT_FALSE(WorkerPoolTestPeer::contextActive(*worker_pool_));
+    EXPECT_NE(WorkerPoolTestPeer::breakerReactivateAfter(*worker_pool_), 0u);
+}
+
+TEST_F(WorkerPoolRailStateTest, SuccessResetsLocalFailureStreak) {
+    WorkerPoolTestPeer::setContextActive(*worker_pool_, true);
+    const int threshold = WorkerPoolTestPeer::contextFailureThreshold();
+    for (int i = 0; i < threshold - 1; ++i)
+        ASSERT_FALSE(
+            WorkerPoolTestPeer::markLocalContextFailure(*worker_pool_));
+
+    WorkerPoolTestPeer::markContextSuccess(*worker_pool_);
+    EXPECT_EQ(WorkerPoolTestPeer::contextFailureCount(*worker_pool_), 0);
+
+    for (int i = 0; i < threshold - 1; ++i)
+        EXPECT_FALSE(
+            WorkerPoolTestPeer::markLocalContextFailure(*worker_pool_));
+    EXPECT_TRUE(WorkerPoolTestPeer::contextActive(*worker_pool_));
+}
+
+TEST_F(WorkerPoolRailStateTest, BreakerReactivatesAtDeadline) {
+    WorkerPoolTestPeer::setContextActive(*worker_pool_, true);
+    for (int i = 0; i < WorkerPoolTestPeer::contextFailureThreshold(); ++i)
+        WorkerPoolTestPeer::markLocalContextFailure(*worker_pool_);
+    const uint64_t deadline =
+        WorkerPoolTestPeer::breakerReactivateAfter(*worker_pool_);
+    ASSERT_NE(deadline, 0u);
+
+    EXPECT_FALSE(
+        WorkerPoolTestPeer::tryReactivateContext(*worker_pool_, deadline - 1));
+    EXPECT_FALSE(WorkerPoolTestPeer::contextActive(*worker_pool_));
+    EXPECT_TRUE(
+        WorkerPoolTestPeer::tryReactivateContext(*worker_pool_, deadline));
+    EXPECT_TRUE(WorkerPoolTestPeer::contextActive(*worker_pool_));
+    EXPECT_EQ(WorkerPoolTestPeer::contextFailureCount(*worker_pool_), 0);
+    EXPECT_EQ(WorkerPoolTestPeer::breakerReactivateAfter(*worker_pool_), 0u);
+}
+
+TEST_F(WorkerPoolRailStateTest, GidRecoveryBlocksBreakerDeadline) {
+    WorkerPoolTestPeer::setContextActive(*worker_pool_, true);
+    for (int i = 0; i < WorkerPoolTestPeer::contextFailureThreshold(); ++i)
+        WorkerPoolTestPeer::markLocalContextFailure(*worker_pool_);
+    const uint64_t deadline =
+        WorkerPoolTestPeer::breakerReactivateAfter(*worker_pool_);
+    ASSERT_NE(deadline, 0u);
+
+    WorkerPoolTestPeer::setRecoveryActivateAfter(*worker_pool_, 1);
+    EXPECT_FALSE(
+        WorkerPoolTestPeer::tryReactivateContext(*worker_pool_, deadline));
+    EXPECT_FALSE(WorkerPoolTestPeer::contextActive(*worker_pool_));
+
+    WorkerPoolTestPeer::setRecoveryActivateAfter(*worker_pool_, 0);
+    EXPECT_TRUE(
+        WorkerPoolTestPeer::tryReactivateContext(*worker_pool_, deadline));
+}
+
+TEST_F(WorkerPoolRailStateTest, FatalEventOwnershipCancelsBreakerDeadline) {
+    WorkerPoolTestPeer::setContextActive(*worker_pool_, true);
+    for (int i = 0; i < WorkerPoolTestPeer::contextFailureThreshold(); ++i)
+        WorkerPoolTestPeer::markLocalContextFailure(*worker_pool_);
+    ASSERT_NE(WorkerPoolTestPeer::breakerReactivateAfter(*worker_pool_), 0u);
+
+    WorkerPoolTestPeer::resetContextBreaker(*worker_pool_, false);
+    EXPECT_EQ(WorkerPoolTestPeer::breakerReactivateAfter(*worker_pool_), 0u);
+    EXPECT_EQ(WorkerPoolTestPeer::contextFailureCount(*worker_pool_), 0);
+    EXPECT_FALSE(WorkerPoolTestPeer::markLocalContextFailure(*worker_pool_));
+    EXPECT_EQ(WorkerPoolTestPeer::breakerReactivateAfter(*worker_pool_), 0u);
+    EXPECT_FALSE(
+        WorkerPoolTestPeer::tryReactivateContext(*worker_pool_, UINT64_MAX));
+    EXPECT_FALSE(WorkerPoolTestPeer::contextActive(*worker_pool_));
 }
 
 }  // namespace
