@@ -1209,6 +1209,7 @@ Do not run binaries from before and after checksum support was introduced in the
 |----------|---------|-------------|
 | `MC_STORE_USE_HUGEPAGE` | unset | Set `1` to request HugeTLB-backed `mmap()` |
 | `MC_STORE_HUGEPAGE_SIZE` | `2MB` | Supported: `2MB`, `512MB`, `1GB` |
+| `MC_STORE_MADV_HUGEPAGE` | unset | Set `1` to back anonymous `mmap()` store segments and client buffers with transparent huge pages (`madvise(MADV_HUGEPAGE)` + eager population) without a HugeTLB pool. Needs THP `enabled` = `always` or `madvise` on the host. Ignored when `MC_STORE_USE_HUGEPAGE` is set; bypasses the mmap arena; does not cover dummy-client shared-memory buffers. Use it on RDMA NICs whose memory-region translation budget is counted per 4 KiB page (e.g. Pensando ionic: ~3 GiB of 4 KiB-backed host MRs per NIC host-wide, `max_mr_size` 2 GiB) |
 | `MC_MMAP_ARENA_POOL_SIZE` | unset | Pre-allocated arena pool size (e.g., `8gb`). Explicitly set to enable the arena |
 | `MC_DISABLE_MMAP_ARENA` | unset | Disable arena, fall back to per-call `mmap()`. Accepts `1`/`true`/`yes`/`on` (or `0`/`false`/`no`/`off`) |
 

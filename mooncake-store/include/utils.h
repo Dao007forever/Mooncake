@@ -1,5 +1,7 @@
 #pragma once
 
+#include "bool_parser.h"
+
 #include <algorithm>
 #include <cctype>
 #include <cstddef>
@@ -356,6 +358,38 @@ inline size_t align_up(size_t size, size_t alignment) {
     }
 
     return size;
+}
+
+/**
+ * @brief Whether anonymous mmap()ed store segments and client buffers should
+ * be backed by transparent huge pages: madvise(MADV_HUGEPAGE) followed by
+ * eager population, controlled by MC_STORE_MADV_HUGEPAGE=1.
+ *
+ * This is the HugeTLB-free alternative to MC_STORE_USE_HUGEPAGE: it needs no
+ * reserved pool, only THP mode "always" or "madvise" on the host. It matters
+ * on RDMA NICs whose memory-region translation budget is counted per 4 KiB
+ * page: Pensando ionic accepts about 3 GiB of 4 KiB-backed host MRs per NIC
+ * across the whole host and then fails ibv_reg_mr() with EINVAL, while
+ * 2 MiB-backed registrations consume 1/512 of that budget. Ignored when
+ * MC_STORE_USE_HUGEPAGE is set (HugeTLB pages are already huge).
+ */
+[[nodiscard]] inline bool thp_madvise_requested() {
+    static const bool requested =
+        []() {
+            const char* env = std::getenv("MC_STORE_MADV_HUGEPAGE");
+            if (env == nullptr) {
+                return false;
+            }
+            const std::optional<bool> parsed = TryParseBool(env);
+            if (!parsed.has_value()) {
+                LOG(WARNING)
+                    << "Ignoring invalid MC_STORE_MADV_HUGEPAGE='" << env
+                    << "'; accepted values: 1/0, true/false, yes/no, on/off";
+                return false;
+            }
+            return *parsed && std::getenv("MC_STORE_USE_HUGEPAGE") == nullptr;
+        }();
+    return requested;
 }
 
 /**

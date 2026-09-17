@@ -44,6 +44,12 @@ ClientBufferAllocator::ClientBufferAllocator(size_t size,
     }
     // Align to 64 bytes(cache line size) for better cache performance
     constexpr size_t alignment = 64;
+    // THP-backed buffers (MC_STORE_MADV_HUGEPAGE) share the mmap allocation
+    // and release paths with HugeTLB buffers.
+    if (!use_hugepage_ && !use_spdk_dma_ && protocol == "rdma" &&
+        thp_madvise_requested()) {
+        use_hugepage_ = true;
+    }
     if (use_hugepage_) {
         buffer_ = allocate_buffer_mmap_memory(size, alignment);
     } else {

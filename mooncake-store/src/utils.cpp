@@ -17,10 +17,14 @@
 #include <unistd.h>
 #include <algorithm>
 #include <atomic>
+#include <cctype>
 #include <cerrno>
 #include <csignal>
+#include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
 #include <memory>
 #include <mutex>
 #include <numa.h>
@@ -180,8 +184,12 @@ static void initializeGlobalArena() {
 // Used by both allocate_buffer_mmap_memory and free_buffer_mmap_memory
 // so they agree on the mapping size.
 static inline size_t mmap_map_size(size_t total_size, size_t hugepage_size) {
-    const size_t page_size =
-        hugepage_size > 0 ? hugepage_size : static_cast<size_t>(getpagesize());
+    // THP-backed mappings (MC_STORE_MADV_HUGEPAGE) round to 2 MiB so the tail
+    // PMD can be huge as well; allocation and release both use this function.
+    const size_t page_size = hugepage_size > 0 ? hugepage_size
+                             : thp_madvise_requested()
+                                 ? SZ_2MB
+                                 : static_cast<size_t>(getpagesize());
     return align_up(total_size, page_size);
 }
 
@@ -283,6 +291,65 @@ void touch_numa_mmap_pages(void *ptr, size_t map_size, size_t page_size,
     }
 }
 
+// Bytes of [addr, addr+size) backed by transparent huge pages, summed over the
+// overlapping VMAs' AnonHugePages in /proc/self/smaps; -1 if unreadable.
+static long long thp_backed_bytes(const void *addr, size_t size) {
+    std::ifstream smaps("/proc/self/smaps");
+    if (!smaps.good()) return -1;
+    const uintptr_t begin = reinterpret_cast<uintptr_t>(addr);
+    const uintptr_t end = begin + size;
+    std::string line;
+    bool in_range = false;
+    long long total = 0;
+    while (std::getline(smaps, line)) {
+        // VMA header lines look like "7f00-7f10 rw-p 00000000 00:00 0 [...]";
+        // attribute lines look like "AnonHugePages:  2048 kB".
+        unsigned long vma_begin = 0, vma_end = 0;
+        if (sscanf(line.c_str(), "%lx-%lx", &vma_begin, &vma_end) == 2) {
+            in_range = vma_begin < end && vma_end > begin;
+            continue;
+        }
+        if (in_range && line.rfind("AnonHugePages:", 0) == 0) {
+            long long kb = 0;
+            if (sscanf(line.c_str(), "AnonHugePages: %lld", &kb) == 1) {
+                total += kb * 1024;
+            }
+        }
+    }
+    return total;
+}
+
+// madvise(MADV_HUGEPAGE) is advisory: with THP disabled on the host or under
+// fragmentation the kernel silently falls back to 4 KiB pages, which on NICs
+// with a per-4KiB-page registration budget (ionic) surfaces later as an
+// ibv_reg_mr() EINVAL. Make the outcome visible right after population.
+static void log_thp_coverage(const char *what, const void *addr, size_t size) {
+    static std::once_flag host_mode_flag;
+    std::call_once(host_mode_flag, [] {
+        std::ifstream mode("/sys/kernel/mm/transparent_hugepage/enabled");
+        std::string value;
+        if (mode.good() && std::getline(mode, value) &&
+            value.find("[never]") != std::string::npos) {
+            LOG(WARNING) << "MC_STORE_MADV_HUGEPAGE set but transparent "
+                            "hugepages are disabled on this host (enabled="
+                         << value << "); mappings will use 4 KiB pages";
+        }
+    });
+    const long long huge = thp_backed_bytes(addr, size);
+    if (huge < 0 || size == 0) return;
+    const double ratio = static_cast<double>(huge) / static_cast<double>(size);
+    if (ratio < 0.95) {
+        LOG(WARNING) << what << ": only " << huge << " of " << size
+                     << " bytes are THP-backed ("
+                     << static_cast<int>(ratio * 100)
+                     << "%); check transparent_hugepage/{enabled,defrag} and "
+                        "memory fragmentation";
+    } else {
+        VLOG(1) << what << ": " << huge << " of " << size
+                << " bytes THP-backed";
+    }
+}
+
 }  // namespace
 
 void populate_hugetlb_mapping(void *ptr, size_t total_size) {
@@ -320,9 +387,21 @@ void *allocate_buffer_mmap_memory(size_t total_size, size_t alignment,
     // Initialize arena on first call
     std::call_once(g_arena_init_flag, initializeGlobalArena);
 
-    // Try arena allocation first (if enabled).
+    // THP (MC_STORE_MADV_HUGEPAGE): the arena pool is MAP_POPULATE'd without
+    // MADV_HUGEPAGE, so THP-backed buffers bypass it and get their own
+    // madvised mapping (mapped lazily, madvised, then populated: MAP_POPULATE
+    // would fault 4 KiB pages before madvise() could run).
+    const bool use_thp =
+        thp_madvise_requested() && get_hugepage_size_from_env() == 0;
+    if (use_thp && g_mmap_arena && g_mmap_arena->isInitialized()) {
+        LOG_FIRST_N(INFO, 1)
+            << "MC_STORE_MADV_HUGEPAGE set: bypassing the mmap arena for "
+               "THP-backed buffers";
+    }
+
+    // Try arena allocation first (if enabled and not THP).
     // Forward caller's alignment so the arena honors the contract.
-    if (g_mmap_arena && g_mmap_arena->isInitialized()) {
+    if (!use_thp && g_mmap_arena && g_mmap_arena->isInitialized()) {
         void *ptr = g_mmap_arena->allocate(total_size, alignment);
         if (ptr != nullptr) {
             VLOG(1) << "Allocated " << total_size << " bytes from arena at "
@@ -343,7 +422,7 @@ void *allocate_buffer_mmap_memory(size_t total_size, size_t alignment,
     const bool defer_direct_population =
         defer_hugetlb_population && get_hugepage_size_from_env() > 0;
     unsigned int flags = MAP_PRIVATE | MAP_ANONYMOUS;
-    if (!defer_direct_population) {
+    if (!defer_direct_population && !use_thp) {
         flags |= MAP_POPULATE;
     }
     const size_t hugepage_size = get_hugepage_size_from_env(&flags);
@@ -363,6 +442,17 @@ void *allocate_buffer_mmap_memory(size_t total_size, size_t alignment,
         LOG(ERROR) << "mmap failed, size=" << map_size << ", errno=" << errno
                    << " (" << strerror(errno) << ")";
         return nullptr;
+    }
+
+    if (use_thp) {
+        if (madvise(ptr, map_size, MADV_HUGEPAGE) != 0) {
+            LOG(WARNING) << "madvise(MADV_HUGEPAGE) failed for " << map_size
+                         << " bytes, errno=" << errno << " (" << strerror(errno)
+                         << "); continuing with regular pages";
+        }
+        // Populate in parallel so the huge pages exist before registration.
+        touch_mmap_pages(ptr, map_size, SZ_2MB);
+        log_thp_coverage("THP mmap buffer", ptr, map_size);
     }
 
     VLOG(1) << "Allocated " << total_size << " bytes via mmap() at " << ptr;
@@ -441,6 +531,16 @@ void *allocate_buffer_numa_segments(size_t total_size,
         return nullptr;
     }
 
+    // THP (MC_STORE_MADV_HUGEPAGE): make the VMA huge-page eligible before the
+    // first fault. HugeTLB mappings are already huge.
+    const bool use_thp = thp_madvise_requested() && !(flags & MAP_HUGETLB);
+    if (use_thp && madvise(ptr, map_size, MADV_HUGEPAGE) != 0) {
+        LOG(WARNING) << "madvise(MADV_HUGEPAGE) failed for NUMA-segmented "
+                        "buffer of "
+                     << map_size << " bytes, errno=" << errno << " ("
+                     << strerror(errno) << "); continuing with regular pages";
+    }
+
     // bind each region to its NUMA node
     int max_node = numa_num_possible_nodes();
     for (size_t i = 0; i < n; ++i) {
@@ -458,9 +558,22 @@ void *allocate_buffer_numa_segments(size_t total_size,
         }
     }
 
-    // Leave the mapping lazy. The caller may explicitly populate it with
-    // NUMA-local workers before registration; otherwise ibv_reg_mr() calls
-    // get_user_pages(), whose faults respect the mbind policy.
+    if (use_thp) {
+        // Populate now (in parallel, node-local when the regions are 2 MiB
+        // multiples, which the caller arranges) so the huge pages exist before
+        // registration; placement follows the per-region mbind policy either
+        // way.
+        if (region_size % SZ_2MB == 0) {
+            touch_numa_mmap_pages(ptr, map_size, SZ_2MB, numa_nodes);
+        } else {
+            touch_mmap_pages(ptr, map_size, SZ_2MB);
+        }
+        log_thp_coverage("THP NUMA-segmented buffer", ptr, map_size);
+    }
+
+    // Otherwise leave the mapping lazy. The caller may explicitly populate it
+    // with NUMA-local workers before registration; otherwise ibv_reg_mr()
+    // calls get_user_pages(), whose faults respect the mbind policy.
 
     LOG(INFO) << "Allocated NUMA-segmented buffer: " << map_size << " bytes, "
               << n << " regions, page_size=" << page_size << ", nodes=[" <<

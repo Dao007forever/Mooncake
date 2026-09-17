@@ -720,6 +720,11 @@ RealClient::RealClient() {
     mooncake::init_ylt_log_level();
     const char *hp = std::getenv("MC_STORE_USE_HUGEPAGE");
     use_hugepage_ = (hp != nullptr);
+    if (thp_madvise_requested()) {
+        LOG(INFO)
+            << "MC_STORE_MADV_HUGEPAGE set: store segments and client "
+               "buffers use madvise(MADV_HUGEPAGE) transparent huge pages";
+    }
 }
 
 RealClient::~RealClient() {
@@ -965,6 +970,11 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
 
         const bool parallel_hugetlb_population =
             protocol == "rdma" && should_use_hugepage;
+        // THP applies to plain rdma host segments only; NUMA-segmented
+        // mappings handle it inside allocate_buffer_numa_segments().
+        const bool thp_single_numa_segment =
+            protocol == "rdma" && !should_use_hugepage &&
+            seg_numa_nodes.empty() && thp_madvise_requested();
 
         while (global_segment_size > 0) {
             size_t segment_size =
@@ -985,8 +995,13 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
                 size_t page_sz = should_use_hugepage
                                      ? get_hugepage_size_from_env()
                                      : static_cast<size_t>(getpagesize());
-                mapped_size =
-                    align_up(segment_size, page_sz * seg_numa_nodes.size());
+                // THP regions are rounded to 2 MiB so every region boundary
+                // sits on a PMD and the populate can run node-local.
+                const size_t region_align =
+                    (!should_use_hugepage && thp_madvise_requested()) ? SZ_2MB
+                                                                      : page_sz;
+                mapped_size = align_up(segment_size,
+                                       region_align * seg_numa_nodes.size());
                 ptr = allocate_buffer_numa_segments(mapped_size, seg_numa_nodes,
                                                     page_sz);
                 seg_location = buildSegmentsLocation(page_sz, seg_numa_nodes);
@@ -1006,6 +1021,10 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
                     mapped_size = actual_size;
                 }
 #endif
+            } else if (thp_single_numa_segment) {
+                // THP-backed single-NUMA segment (MC_STORE_MADV_HUGEPAGE).
+                ptr = allocate_buffer_mmap_memory(
+                    segment_size, static_cast<size_t>(getpagesize()));
             } else {
                 ptr = allocate_buffer_allocator_memory(segment_size,
                                                        this->protocol);
@@ -1036,9 +1055,10 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
             } else if (this->protocol == "ub") {
                 ub_segment_ptrs_.emplace_back(ptr,
                                               UbSegmentDeleter{mapped_size});
-            } else if (!seg_numa_nodes.empty() || should_use_hugepage) {
-                // NUMA-segmented or hugepage: track as mmap allocation for
-                // munmap cleanup
+            } else if (!seg_numa_nodes.empty() || should_use_hugepage ||
+                       thp_single_numa_segment) {
+                // NUMA-segmented, hugepage or THP: track as mmap allocation
+                // for munmap cleanup
                 hugepage_segment_ptrs_.emplace_back(
                     ptr, HugepageSegmentDeleter{mapped_size});
             } else {

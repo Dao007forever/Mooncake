@@ -89,6 +89,34 @@ TEST_F(ClientBufferTest, SpdkDmaAllocatorDestroysWithSpdkFree) {
 }
 #endif
 
+// Run in separate processes with MC_STORE_MADV_HUGEPAGE=0 and =1: the
+// allocation policy is cached on first use. Huge-page availability is advisory.
+TEST_F(ClientBufferTest, RdmaOwnedBufferRoundTrip) {
+    const size_t size = 3 * 1024 * 1024 + 64;
+    auto allocator = ClientBufferAllocator::create(size, "rdma");
+    ASSERT_NE(allocator, nullptr);
+    ASSERT_NE(allocator->getBase(), nullptr);
+    VerifyAlignment(allocator->getBase());
+    auto* bytes = static_cast<unsigned char*>(allocator->getBase());
+    std::memset(bytes, 0x5a, size);
+    for (size_t i = 0; i < size; i += 4096) EXPECT_EQ(bytes[i], 0x5a);
+    EXPECT_EQ(bytes[size - 1], 0x5a);
+}
+
+TEST_F(ClientBufferTest, RdmaExternalBufferRetainsCallerOwnership) {
+    std::vector<unsigned char> storage(3 * 1024 * 1024 + 64, 0x5a);
+    {
+        auto allocator = ClientBufferAllocator::create(storage.data(),
+                                                       storage.size(), "rdma");
+        ASSERT_NE(allocator, nullptr);
+        EXPECT_EQ(allocator->getBase(), storage.data());
+    }
+    // The allocator must not free or munmap a caller-owned buffer in THP mode.
+    std::memset(storage.data(), 0xa5, storage.size());
+    EXPECT_EQ(storage.front(), 0xa5);
+    EXPECT_EQ(storage.back(), 0xa5);
+}
+
 // Test multiple allocations
 TEST_F(ClientBufferTest, MultipleAllocations) {
     const size_t buffer_size = 1024 * 1024;  // 1MB
