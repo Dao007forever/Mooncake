@@ -63,6 +63,7 @@ class SubmitTransferTaskTest : public ::testing::Test {
         auto desc = std::make_shared<SegmentDesc>();
         desc->name = "unit-test-server:1234";
         desc->protocol = "rdma";
+        desc->devices.push_back({"mlx5_unit_test", 0, "", ""});
         BufferDesc buffer;
         buffer.name = "cpu:0";
         buffer.addr = kBufferAddr;

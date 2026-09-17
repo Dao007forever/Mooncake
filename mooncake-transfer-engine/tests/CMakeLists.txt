@@ -481,3 +481,18 @@ if(USE_NCCL_DEVICE AND NOT USE_CXI)
     endif()
   endif()
 endif()
+
+# Hardware-free regression tests for sparse RDMA MR registration and routing.
+add_executable(rdma_nic_selection_test ${WORKSPACE}/rdma_nic_selection_test.cpp)
+target_link_libraries(rdma_nic_selection_test PUBLIC transfer_engine gtest
+                                                     gtest_main)
+add_test(NAME rdma_nic_selection_test COMMAND rdma_nic_selection_test)
+
+if(USE_CUDA OR USE_HIP)
+  add_executable(rdma_local_nic_gpu_test
+                 ${WORKSPACE}/rdma_local_nic_gpu_test.cpp)
+  target_link_libraries(rdma_local_nic_gpu_test PUBLIC transfer_engine gtest
+                                                       gtest_main)
+  add_test(NAME rdma_local_nic_gpu_test COMMAND rdma_local_nic_gpu_test)
+  set_tests_properties(rdma_local_nic_gpu_test PROPERTIES LABELS "rdma;gpu")
+endif()

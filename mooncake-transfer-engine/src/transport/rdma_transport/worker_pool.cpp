@@ -366,8 +366,8 @@ int WorkerPool::submitPostSend(
             for (size_t alt_dev_id = 0;
                  alt_dev_id < peer_segment_desc->devices.size(); ++alt_dev_id) {
                 if (alt_dev_id == (size_t)device_id ||
-                    alt_dev_id >=
-                        peer_segment_desc->buffers[buffer_id].rkey.size()) {
+                    !RdmaTransport::hasRegisteredKey(
+                        peer_segment_desc->buffers[buffer_id], alt_dev_id)) {
                     continue;
                 }
                 auto alt_path =
@@ -997,8 +997,9 @@ void WorkerPool::redispatch(std::vector<Transport::Slice *> &slice_list,
                      alt_dev_id < peer_segment_desc->devices.size();
                      ++alt_dev_id) {
                     if (alt_dev_id == (size_t)device_id ||
-                        alt_dev_id >=
-                            peer_segment_desc->buffers[buffer_id].rkey.size()) {
+                        !RdmaTransport::hasRegisteredKey(
+                            peer_segment_desc->buffers[buffer_id],
+                            alt_dev_id)) {
                         continue;
                     }
                     auto alt_path = MakeNicPath(

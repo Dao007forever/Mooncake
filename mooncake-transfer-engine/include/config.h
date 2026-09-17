@@ -38,6 +38,7 @@ enum class EfaNicSelection {
     ALL = 0,    // every NIC, the historical behavior
     LOCAL = 1,  // device memory only on that GPU's topology-local NICs
 };
+enum class RdmaNicSelection { ALL = 0, LOCAL = 1 };
 
 struct GlobalConfig {
     size_t num_cq_per_ctx = 1;
@@ -117,6 +118,9 @@ struct GlobalConfig {
     // NICs the topology reports as closest to that GPU. Set via
     // MC_EFA_NIC_SELECTION=all|local; see efa_transport.cpp for the trade-off.
     EfaNicSelection efa_nic_selection = EfaNicSelection::ALL;
+    // MC_RDMA_NIC_SELECTION=all|local. LOCAL registers device memory only
+    // on its topology-preferred NICs; host memory keeps full NIC coverage.
+    RdmaNicSelection rdma_nic_selection = RdmaNicSelection::ALL;
     size_t eic_max_block_size = 64UL * 1024 * 1024;
     EndpointStoreType endpoint_store_type = EndpointStoreType::SIEVE;
     int ib_traffic_class = -1;

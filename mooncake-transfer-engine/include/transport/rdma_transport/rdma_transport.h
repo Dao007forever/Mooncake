@@ -108,7 +108,7 @@ class RdmaTransport : public Transport {
     int refreshLocalDeviceDesc(const std::string &device_name, uint16_t lid,
                                const std::string &gid);
 
-    int preTouchMemory(void *addr, size_t length);
+    int preTouchMemory(void *addr, size_t length, size_t context_index);
 
    public:
     virtual int onSetupRdmaConnections(const HandShakeDesc &peer_desc,
@@ -127,11 +127,28 @@ class RdmaTransport : public Transport {
     int startHandshakeDaemon(std::string &local_server_name);
 
    public:
+    // Invert existing preferred_hca lists into opened context indices.
+    // Exposed for hardware-free tests, as in EfaTransport::buildLocalNicMap.
+    static std::unordered_map<std::string, std::vector<size_t>>
+    buildLocalNicMap(const TopologyMatrix &matrix,
+                     const std::vector<std::string> &device_names);
+
+    // Keep segment-wide device indices; zero denotes an unregistered NIC,
+    // following the EFA transport's sparse-key convention.
+    static bool hasRegisteredKey(const BufferDesc &buffer, int device_id,
+                                 bool require_remote_key = true) {
+        const auto &keys = require_remote_key ? buffer.rkey : buffer.lkey;
+        return device_id >= 0 && static_cast<size_t>(device_id) < keys.size() &&
+               keys[device_id] != 0;
+    }
+
     static int selectDevice(SegmentDesc *desc, uint64_t offset, size_t length,
-                            int &buffer_id, int &device_id, int retry_cnt = 0);
+                            int &buffer_id, int &device_id, int retry_cnt = 0,
+                            bool require_remote_key = true);
     static int selectDevice(SegmentDesc *desc, uint64_t offset, size_t length,
                             std::string_view hint, int &buffer_id,
-                            int &device_id, int retry_cnt = 0);
+                            int &device_id, int retry_cnt = 0,
+                            bool require_remote_key = true);
     static int selectDeviceByLocalHca(SegmentDesc *desc, uint64_t offset,
                                       size_t length, std::string_view local_hca,
                                       int &buffer_id, int &device_id,
@@ -144,6 +161,8 @@ class RdmaTransport : public Transport {
    private:
     std::vector<std::shared_ptr<RdmaContext>> context_list_;
     std::shared_ptr<Topology> local_topology_;
+    // Immutable after install(). Empty in the default ALL mode.
+    std::unordered_map<std::string, std::vector<size_t>> local_nic_map_;
     // When MC_RDMA_BIND_ADDRESS is set in a dual-NIC environment,
     // rdma_server_name_ holds the RDMA-reachable address (e.g.
     // "192.168.0.y:port") for NIC path construction, while

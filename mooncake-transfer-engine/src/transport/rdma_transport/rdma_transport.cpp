@@ -23,6 +23,7 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdlib>
+#include <numeric>
 #include <set>
 #include <thread>
 #include <utility>
@@ -231,7 +232,8 @@ int RdmaTransport::install(std::string &local_server_name,
     return 0;
 }
 
-int RdmaTransport::preTouchMemory(void *addr, size_t length) {
+int RdmaTransport::preTouchMemory(void *addr, size_t length,
+                                  size_t context_index) {
     if (context_list_.size() == 0) {
         // At least one context is required for pre-touch.
         return 0;
@@ -254,8 +256,9 @@ int RdmaTransport::preTouchMemory(void *addr, size_t length) {
     for (size_t thread_i = 0; thread_i < num_threads; ++thread_i) {
         void *block_addr = static_cast<char *>(addr) + thread_i * block_size;
         threads.emplace_back([this, thread_i, block_addr, block_size,
-                              &thread_results]() {
-            int ret = context_list_[0]->preTouchMemory(block_addr, block_size);
+                              context_index, &thread_results]() {
+            int ret = context_list_[context_index]->preTouchMemory(block_addr,
+                                                                   block_size);
             thread_results[thread_i] = ret;
         });
     }
@@ -328,6 +331,27 @@ int RdmaTransport::registerLocalMemoryInternal(void *addr, size_t length,
         resolved_name = name;
     }
 
+    std::vector<size_t> registration_nics(context_list_.size());
+    std::iota(registration_nics.begin(), registration_nics.end(), 0);
+    const bool device_location =
+        resolved_name != kWildcardLocation &&
+        resolved_name.rfind("cpu:", 0) != 0 &&
+        resolved_name.rfind(kSegmentsLocationPrefix, 0) != 0;
+    if (globalConfig().rdma_nic_selection == RdmaNicSelection::LOCAL &&
+        device_location) {
+        auto it = local_nic_map_.find(resolved_name);
+        if (it == local_nic_map_.end()) {
+            LOG(ERROR)
+                << "RDMA local NIC selection: no opened preferred NIC for "
+                << resolved_name
+                << "; check topology and MC_TE_FILTERS (use all to "
+                   "explicitly allow non-local registration)";
+            return ERR_DEVICE_NOT_FOUND;
+        }
+        registration_nics = it->second;
+    }
+    if (registration_nics.empty()) return ERR_DEVICE_NOT_FOUND;
+
     // Export a single dma_buf fd for the whole buffer and import it into every
     // NIC's PD during each chunk's registration below (one dma_buf object
     // shared across NICs keeps a single BAR1 window for the buffer instead of
@@ -354,8 +378,8 @@ int RdmaTransport::registerLocalMemoryInternal(void *addr, size_t length,
     // not a "committed" chunk, so rollbackChunks() below must not touch its
     // (never-added) metadata, but its partial MRs still need releasing.
     auto unregisterChunkMRs = [&](void *chunk_addr) {
-        for (auto &context : context_list_) {
-            int ret = context->unregisterMemoryRegion(chunk_addr);
+        for (size_t i : registration_nics) {
+            int ret = context_list_[i]->unregisterMemoryRegion(chunk_addr);
             if (ret)
                 LOG(WARNING) << "Rollback: failed to unregister chunk MR at "
                              << chunk_addr << " (ret=" << ret << ")";
@@ -402,7 +426,8 @@ int RdmaTransport::registerLocalMemoryInternal(void *addr, size_t length,
 
         if (do_pre_touch) {
             // Parallel pre-touch the memory to speed up registration.
-            int ret = preTouchMemory(chunk_addr, chunk_len);
+            int ret = preTouchMemory(chunk_addr, chunk_len,
+                                     registration_nics.front());
             if (ret != 0) {
                 // pre-touch is before MR registration for chunk ci, so ci has
                 // no MR/metadata yet: roll back only committed chunks [0, ci).
@@ -429,11 +454,11 @@ int RdmaTransport::registerLocalMemoryInternal(void *addr, size_t length,
 
         if (use_parallel_reg) {
             std::vector<std::thread> reg_threads;
-            reg_threads.reserve(context_list_.size());
+            reg_threads.reserve(registration_nics.size());
             std::vector<int> ret_codes(context_list_.size(), 0);
             const int ar = access_rights;  // Local copy for lambda capture
 
-            for (size_t i = 0; i < context_list_.size(); ++i) {
+            for (size_t i : registration_nics) {
                 reg_threads.emplace_back([this, &ret_codes, chunk_dmabuf_exp, i,
                                           chunk_addr, chunk_len, ar]() {
                     ret_codes[i] = context_list_[i]->registerMemoryRegion(
@@ -456,7 +481,7 @@ int RdmaTransport::registerLocalMemoryInternal(void *addr, size_t length,
                 }
             }
         } else {
-            for (size_t i = 0; i < context_list_.size(); ++i) {
+            for (size_t i : registration_nics) {
                 int ret = context_list_[i]->registerMemoryRegion(
                     chunk_addr, chunk_len, access_rights, chunk_dmabuf_exp);
                 if (ret) {
@@ -481,17 +506,23 @@ int RdmaTransport::registerLocalMemoryInternal(void *addr, size_t length,
             LOG(INFO) << "registerMemoryRegion: chunk " << ci << "/"
                       << chunks.size() << ", addr=" << chunk_addr
                       << ", length=" << chunk_len
-                      << ", contexts=" << context_list_.size()
+                      << ", registered_contexts=" << registration_nics.size()
+                      << "/" << context_list_.size()
+                      << ", location=" << resolved_name
                       << ", parallel=" << (use_parallel_reg ? "true" : "false")
                       << ", duration=" << reg_duration_ms << "ms";
         }
 
         // Collect per-context keys for THIS chunk (address-range lookup).
         BufferDesc buffer_desc;
-        for (auto &context : context_list_) {
-            buffer_desc.lkey.push_back(context->lkey(chunk_addr));
+        // Preserve global device indices, even for skipped NICs. Never query
+        // missing MRs: RdmaContext::lkey/rkey would log an error for each one.
+        buffer_desc.lkey.resize(context_list_.size(), 0);
+        if (remote_accessible) buffer_desc.rkey.resize(context_list_.size(), 0);
+        for (size_t i : registration_nics) {
+            buffer_desc.lkey[i] = context_list_[i]->lkey(chunk_addr);
             if (remote_accessible)
-                buffer_desc.rkey.push_back(context->rkey(chunk_addr));
+                buffer_desc.rkey[i] = context_list_[i]->rkey(chunk_addr);
         }
         buffer_desc.name = resolved_name;
         buffer_desc.addr = (uint64_t)chunk_addr;
@@ -881,8 +912,8 @@ Status RdmaTransport::submitTransferTask(
 
         auto request_buffer_id = -1, request_device_id = -1;
         if (selectDevice(local_segment_desc.get(), (uint64_t)request.source,
-                         request.length, request_buffer_id,
-                         request_device_id)) {
+                         request.length, request_buffer_id, request_device_id,
+                         0, /*require_remote_key=*/false)) {
             request_buffer_id = -1;
             request_device_id = -1;
         }
@@ -926,7 +957,8 @@ Status RdmaTransport::submitTransferTask(
             while (retry_cnt < kMaxRetryCount && !found_device) {
                 if (selectDevice(local_segment_desc.get(),
                                  (uint64_t)slice->source_addr, slice->length,
-                                 buffer_id, device_id, retry_cnt++))
+                                 buffer_id, device_id, retry_cnt++,
+                                 /*require_remote_key=*/false))
                     continue;
                 assert(device_id >= 0 &&
                        static_cast<size_t>(device_id) < context_list_.size());
@@ -1103,6 +1135,26 @@ int RdmaTransport::onSetupRdmaConnections(const HandShakeDesc &peer_desc,
     return ret;
 }
 
+std::unordered_map<std::string, std::vector<size_t>>
+RdmaTransport::buildLocalNicMap(const TopologyMatrix &matrix,
+                                const std::vector<std::string> &device_names) {
+    std::unordered_map<std::string, size_t> indices;
+    for (size_t i = 0; i < device_names.size(); ++i)
+        indices[device_names[i]] = i;
+    std::unordered_map<std::string, std::vector<size_t>> result;
+    for (const auto &entry : matrix) {
+        std::vector<size_t> local;
+        for (const auto &nic : entry.second.preferred_hca) {
+            auto it = indices.find(nic);
+            if (it != indices.end() && std::find(local.begin(), local.end(),
+                                                 it->second) == local.end())
+                local.push_back(it->second);
+        }
+        if (!local.empty()) result.emplace(entry.first, std::move(local));
+    }
+    return result;
+}
+
 int RdmaTransport::initializeRdmaResources() {
     auto hca_list = local_topology_->getHcaList();
     for (auto &device_name : hca_list) {
@@ -1139,6 +1191,19 @@ int RdmaTransport::initializeRdmaResources() {
         LOG(ERROR) << "RdmaTransport: No available RNIC";
         return ERR_DEVICE_NOT_FOUND;
     }
+    if (globalConfig().rdma_nic_selection == RdmaNicSelection::LOCAL) {
+        std::vector<std::string> names;
+        for (const auto &context : context_list_)
+            names.push_back(context->deviceName());
+        local_nic_map_ = buildLocalNicMap(local_topology_->getMatrix(), names);
+        for (const auto &entry : local_nic_map_) {
+            std::string nics;
+            for (size_t i : entry.second)
+                nics += (nics.empty() ? "" : ",") + names[i];
+            LOG(INFO) << "RdmaTransport: local NICs for " << entry.first
+                      << ": [" << nics << "]";
+        }
+    }
     return 0;
 }
 
@@ -1149,13 +1214,76 @@ int RdmaTransport::startHandshakeDaemon(std::string &local_server_name) {
         metadata_->localRpcMeta().rpc_port, metadata_->localRpcMeta().sockfd);
 }
 
+// Initial selection preserves topology hints and rail affinity. If that NIC
+// has no MR, search the remaining registered candidates with a bounded scan.
+// This check is unconditional: an ALL-mode sender can receive sparse metadata
+// from a LOCAL-mode peer. A hint must not pin every retry to an unregistered
+// NIC.
+static int selectRegisteredDevice(RdmaTransport::SegmentDesc *desc,
+                                  const RdmaTransport::BufferDesc &buffer,
+                                  const std::string &location,
+                                  std::string_view hint, int retry_count,
+                                  bool hca_affinity,
+                                  bool require_remote_key = true) {
+    const auto &hca_list = desc->topology.getHcaList();
+    if (desc->devices.empty() || hca_list.empty()) return ERR_DEVICE_NOT_FOUND;
+    const auto registered_device = [&](int topology_id) -> int {
+        if (topology_id < 0 ||
+            static_cast<size_t>(topology_id) >= hca_list.size())
+            return ERR_DEVICE_NOT_FOUND;
+
+        // Parsing a peer topology may compact its indices, while the segment's
+        // device and MR-key arrays retain their original indices. Resolve the
+        // NIC's name before looking up its keys, keeping the common aligned
+        // case O(1).
+        const auto &hca = hca_list[topology_id];
+        size_t device_id = static_cast<size_t>(topology_id);
+        if (device_id >= desc->devices.size() ||
+            desc->devices[device_id].name != hca) {
+            auto it = std::find_if(
+                desc->devices.begin(), desc->devices.end(),
+                [&](const auto &device) { return device.name == hca; });
+            if (it == desc->devices.end()) return ERR_DEVICE_NOT_FOUND;
+            device_id = static_cast<size_t>(it - desc->devices.begin());
+        }
+        return RdmaTransport::hasRegisteredKey(buffer, device_id,
+                                               require_remote_key)
+                   ? static_cast<int>(device_id)
+                   : ERR_DEVICE_NOT_FOUND;
+    };
+    const auto select = [&](const std::string &name) {
+        int id = registered_device(
+            hca_affinity
+                ? desc->topology.selectDeviceByLocalHca(name, hint, retry_count)
+                : desc->topology.selectDevice(name, hint, retry_count));
+        if (id >= 0) return id;
+        // retry_count=0 is random; retries 1..N enumerate all candidates.
+        // Include a full deterministic cycle, even if the initial pick repeats.
+        for (size_t i = 0; i < hca_list.size(); ++i) {
+            int attempt =
+                1 + (static_cast<size_t>(std::max(retry_count, 0)) + i) %
+                        hca_list.size();
+            if (hca_affinity) {
+                id = registered_device(
+                    desc->topology.selectDeviceByLocalHca(name, hint, attempt));
+                if (id >= 0) return id;
+            }
+            id = registered_device(desc->topology.selectDevice(name, attempt));
+            if (id >= 0) return id;
+        }
+        return ERR_DEVICE_NOT_FOUND;
+    };
+    int id = select(location);
+    return id >= 0 ? id : select(kWildcardLocation);
+}
+
 // According to the request desc, offset and length information, find proper
 // buffer_id and device_id as output.
 // Return 0 if successful, ERR_ADDRESS_NOT_REGISTERED otherwise.
 int RdmaTransport::selectDevice(SegmentDesc *desc, uint64_t offset,
                                 size_t length, std::string_view hint,
-                                int &buffer_id, int &device_id,
-                                int retry_count) {
+                                int &buffer_id, int &device_id, int retry_count,
+                                bool require_remote_key) {
     if (desc == nullptr) return ERR_ADDRESS_NOT_REGISTERED;
     const auto &buffers = desc->buffers;
     for (buffer_id = 0; buffer_id < static_cast<int>(buffers.size());
@@ -1188,14 +1316,8 @@ int RdmaTransport::selectDevice(SegmentDesc *desc, uint64_t offset,
         }
 
         device_id =
-            hint.empty()
-                ? desc->topology.selectDevice(location, retry_count)
-                : desc->topology.selectDevice(location, hint, retry_count);
-        if (device_id >= 0) return 0;
-        device_id = hint.empty() ? desc->topology.selectDevice(
-                                       kWildcardLocation, retry_count)
-                                 : desc->topology.selectDevice(
-                                       kWildcardLocation, hint, retry_count);
+            selectRegisteredDevice(desc, buffer, location, hint, retry_count,
+                                   false, require_remote_key);
         if (device_id >= 0) return 0;
     }
     return ERR_ADDRESS_NOT_REGISTERED;
@@ -1224,11 +1346,8 @@ int RdmaTransport::selectDeviceByLocalHca(SegmentDesc *desc, uint64_t offset,
         }
 
         const auto location = resolveBufferLocation(buffer, offset);
-        device_id = desc->topology.selectDeviceByLocalHca(location, local_hca,
-                                                          retry_count);
-        if (device_id >= 0) return 0;
-        device_id = desc->topology.selectDeviceByLocalHca(
-            kWildcardLocation, local_hca, retry_count);
+        device_id = selectRegisteredDevice(desc, buffer, location, local_hca,
+                                           retry_count, true);
         if (device_id >= 0) return 0;
     }
     return ERR_ADDRESS_NOT_REGISTERED;
@@ -1236,8 +1355,8 @@ int RdmaTransport::selectDeviceByLocalHca(SegmentDesc *desc, uint64_t offset,
 
 int RdmaTransport::selectDevice(SegmentDesc *desc, uint64_t offset,
                                 size_t length, int &buffer_id, int &device_id,
-                                int retry_count) {
+                                int retry_count, bool require_remote_key) {
     return selectDevice(desc, offset, length, "", buffer_id, device_id,
-                        retry_count);
+                        retry_count, require_remote_key);
 }
 }  // namespace mooncake
