@@ -16,9 +16,12 @@
 #define RDMA_ENDPOINT_H
 
 #include <atomic>
+#include <deque>
 #include <queue>
+#include <vector>
 
 #include "rdma_context.h"
+#include "rdma_posted_fifo.h"
 
 namespace mooncake {
 
@@ -152,6 +155,14 @@ class RdmaEndPoint {
     int submitPostSend(std::vector<Transport::Slice *> &slice_list,
                        std::vector<Transport::Slice *> &failed_slice_list);
 
+    // Map a signaled CQE onto the posting-order FIFO for that QP. On
+    // success or failure, retires the prefix through this WR. Later WRs
+    // remain alive until their own completion or flush CQEs arrive.
+    // Decrements wr_depth by the number of retired slices. Returns 0 if
+    // `signaled` is not in the FIFO (already collected).
+    size_t collectPostedCompletions(Transport::Slice *signaled, bool success,
+                                    std::vector<Transport::Slice *> &out);
+
     // Get the number of QPs in this endpoint
     size_t getQPNumber() const;
 
@@ -225,6 +236,12 @@ class RdmaEndPoint {
     int max_wr_depth_;
     size_t max_sge_per_wr_;
     size_t max_inline_bytes_;
+
+    // One posting-order FIFO per QP so a signaled CQE can retire the
+    // unsignaled WRs that preceded it. unsignaled_since_signal_ is the
+    // number of consecutive unsignaled WRs already on that QP's SQ.
+    std::vector<std::deque<Transport::Slice *>> posted_fifo_;
+    std::vector<int> unsignaled_since_signal_;
 
     std::atomic<bool> active_;
     ibv_cq *cq_;

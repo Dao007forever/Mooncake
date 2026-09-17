@@ -23,6 +23,7 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -60,6 +61,8 @@ class RdmaTransport : public Transport {
                 std::shared_ptr<Topology> topo) override;
 
     const char *getName() const override { return "rdma"; }
+
+    bool supportsBatchCompletionCounter() const override { return true; }
 
     int registerLocalMemory(void *addr, size_t length,
                             const std::string &location, bool remote_accessible,
@@ -144,15 +147,19 @@ class RdmaTransport : public Transport {
 
     static int selectDevice(SegmentDesc *desc, uint64_t offset, size_t length,
                             int &buffer_id, int &device_id, int retry_cnt = 0,
+                            int hint_buffer_id = -1, int hint_device_id = -1,
                             bool require_remote_key = true);
     static int selectDevice(SegmentDesc *desc, uint64_t offset, size_t length,
                             std::string_view hint, int &buffer_id,
                             int &device_id, int retry_cnt = 0,
+                            int hint_buffer_id = -1, int hint_device_id = -1,
                             bool require_remote_key = true);
     static int selectDeviceByLocalHca(SegmentDesc *desc, uint64_t offset,
                                       size_t length, std::string_view local_hca,
                                       int &buffer_id, int &device_id,
-                                      int retry_cnt = 0);
+                                      int retry_cnt = 0,
+                                      int hint_buffer_id = -1,
+                                      int hint_device_id = -1);
 
     const std::vector<std::shared_ptr<RdmaContext>> &getContextList() const {
         return context_list_;

@@ -95,6 +95,16 @@ class Topology {
     int selectDeviceByLocalHca(const std::string storage_type,
                                std::string_view local_hca, int retry_count = 0);
 
+    bool hasDevice(const std::string &location,
+                   const std::string &device) const {
+        const auto it = resolved_matrix_.find(location);
+        if (it != resolved_matrix_.end() && it->second.getHcaIndex(device) >= 0)
+            return true;
+        const auto any = resolved_matrix_.find("*");
+        return any != resolved_matrix_.end() &&
+               any->second.getHcaIndex(device) >= 0;
+    }
+
     TopologyMatrix getMatrix() const { return matrix_; }
 
     const std::vector<std::string> &getHcaList() const { return hca_list_; }

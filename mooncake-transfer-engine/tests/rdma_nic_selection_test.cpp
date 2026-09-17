@@ -301,13 +301,50 @@ TEST_F(RdmaRegisteredNicTest, LocalOnlyBufferUsesLkeyButCannotBeRemoteTarget) {
     for (int retry = 0; retry < 8; ++retry) {
         int buffer = -1, device = -1;
         ASSERT_EQ(RdmaTransport::selectDevice(&desc, 0x10000, 1024, buffer,
-                                              device, retry, false),
+                                              device, retry, -1, -1, false),
                   0);
         EXPECT_EQ(device, index("nic1"));
         EXPECT_EQ(RdmaTransport::selectDevice(&desc, 0x10000, 1024, buffer,
                                               device, retry),
                   ERR_ADDRESS_NOT_REGISTERED);
     }
+}
+
+TEST_F(RdmaRegisteredNicTest, CachedDeviceRejectsMissingKeysAndDisabledNic) {
+    registerOn("nic0");
+    registerOn("nic2");
+    desc.rebuildBufferRangeIndex();
+    desc.buffers[0].rkey[index("nic0")] = 0;
+    int buffer = -1, device = -1;
+    ASSERT_EQ(RdmaTransport::selectDevice(&desc, 0x10000, 1024, buffer, device,
+                                          0, 0, index("nic0")),
+              0);
+    EXPECT_EQ(device, index("nic2"));
+    desc.buffers[0].rkey[index("nic0")] = 123;
+    ASSERT_EQ(desc.topology.disableDevice("nic0"), 0);
+    ASSERT_EQ(RdmaTransport::selectDevice(&desc, 0x10000, 1024, buffer, device,
+                                          0, 0, index("nic0")),
+              0);
+    EXPECT_EQ(device, index("nic2"));
+    ASSERT_EQ(RdmaTransport::selectDeviceByLocalHca(&desc, 0x10000, 1024,
+                                                    "source", buffer, device, 0,
+                                                    0, index("nic0")),
+              0);
+    EXPECT_EQ(device, index("nic2"));
+}
+
+TEST_F(RdmaRegisteredNicTest, CachedLocalOnlyDeviceUsesLocalKey) {
+    registerOn("nic1");
+    desc.buffers[0].rkey.clear();
+    desc.rebuildBufferRangeIndex();
+    int buffer = -1, device = -1;
+    ASSERT_EQ(RdmaTransport::selectDevice(&desc, 0x10000, 1024, buffer, device,
+                                          0, 0, index("nic1"), false),
+              0);
+    EXPECT_EQ(device, index("nic1"));
+    EXPECT_EQ(RdmaTransport::selectDevice(&desc, 0x10000, 1024, buffer, device,
+                                          0, 0, index("nic1")),
+              ERR_ADDRESS_NOT_REGISTERED);
 }
 
 TEST_F(RdmaRegisteredNicTest, RejectsMissingKeysAndMalformedIndices) {

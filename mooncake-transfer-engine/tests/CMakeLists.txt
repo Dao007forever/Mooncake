@@ -48,14 +48,24 @@ target_link_libraries(rdma_endpoint_state_test PUBLIC transfer_engine gtest
                                                       gtest_main)
 add_test(NAME rdma_endpoint_state_test COMMAND rdma_endpoint_state_test)
 
+add_executable(rdma_posted_fifo_test ${WORKSPACE}/rdma_posted_fifo_test.cpp)
+target_link_libraries(rdma_posted_fifo_test PUBLIC transfer_engine gtest
+                                                   gtest_main)
+add_test(NAME rdma_posted_fifo_test COMMAND rdma_posted_fifo_test)
+
 # Hardware-free regression tests for peer-rail pausing and the local-WC context
 # breaker. Both are plain per-worker-pool state, so this runs on every CI runner
 # without an RDMA device.
 add_executable(worker_pool_rail_state_test
                ${WORKSPACE}/worker_pool_rail_state_test.cpp)
+target_include_directories(worker_pool_rail_state_test
+                           PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(worker_pool_rail_state_test PUBLIC transfer_engine gtest
                                                          gtest_main)
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+  # Link RDMA objects directly so --wrap also works with shared libraries.
+  target_sources(worker_pool_rail_state_test
+                 PRIVATE $<TARGET_OBJECTS:rdma_transport>)
   # Control GID I/O to exercise recovery while completion failures arrive.
   target_link_options(
     worker_pool_rail_state_test
@@ -404,6 +414,12 @@ target_link_libraries(rdma_transport_submit_task_test PUBLIC transfer_engine
 add_test(NAME rdma_transport_submit_task_test
          COMMAND rdma_transport_submit_task_test)
 
+add_executable(rdma_buffer_range_index_test
+               ${WORKSPACE}/rdma_buffer_range_index_test.cpp)
+target_link_libraries(rdma_buffer_range_index_test PUBLIC transfer_engine gtest
+                                                          gtest_main)
+add_test(NAME rdma_buffer_range_index_test COMMAND rdma_buffer_range_index_test)
+
 add_executable(topology_test ${WORKSPACE}/topology_test.cpp)
 target_link_libraries(topology_test PUBLIC transfer_engine gtest gtest_main)
 add_test(NAME topology_test COMMAND topology_test)
@@ -515,3 +531,8 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
                       "-Wl,--wrap=ibv_reg_mr_iova2" "-Wl,--wrap=ibv_dereg_mr")
   add_test(NAME rdma_mr_override_test COMMAND rdma_mr_override_test)
 endif()
+
+add_executable(batch_counter_wait_test ${WORKSPACE}/batch_counter_wait_test.cpp)
+target_link_libraries(batch_counter_wait_test PUBLIC transfer_engine gtest
+                                                     gtest_main)
+add_test(NAME batch_counter_wait_test COMMAND batch_counter_wait_test)
