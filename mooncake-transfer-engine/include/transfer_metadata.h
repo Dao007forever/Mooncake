@@ -117,7 +117,18 @@ class TransferMetadata {
         // Copying a SegmentDesc copies this snapshot; a subsequent
         // push_back/erase must call rebuildBufferRangeIndex() again.
         BufferRangeIndex buffer_range_index;
-        void rebuildBufferRangeIndex() { buffer_range_index.rebuild(buffers); }
+        void rebuildBufferRangeIndex() {
+#ifdef ENABLE_MULTI_PROTOCOL
+            // HIP and RDMA legitimately register the same address. Only RDMA
+            // ranges participate in this RDMA lookup index; preserve the
+            // original buffers-vector indices for lkey/rkey lookup.
+            buffer_range_index.rebuild(buffers, [](const BufferDesc &buffer) {
+                return buffer.protocol.empty() || buffer.protocol == "rdma";
+            });
+#else
+            buffer_range_index.rebuild(buffers);
+#endif
+        }
         // Share immutable path strings across slices in a submission. The
         // caller owns them independently of metadata refresh and teardown.
         using NicPaths = std::vector<std::shared_ptr<const std::string>>;

@@ -61,9 +61,17 @@ class BufferRangeIndex {
 
     template <typename Buffer>
     void rebuild(const std::vector<Buffer> &buffers) {
+        rebuild(buffers, [](const Buffer &) { return true; });
+    }
+
+    // Keep original vector indices when excluding aliases of other protocols.
+    template <typename Buffer, typename Predicate>
+    void rebuild(const std::vector<Buffer> &buffers, Predicate eligible) {
+        source_size_ = buffers.size();
         by_start_.clear();
         by_start_.reserve(buffers.size());
         for (size_t i = 0; i < buffers.size(); ++i) {
+            if (!eligible(buffers[i])) continue;
             by_start_.push_back(
                 Entry{buffers[i].addr, buffers[i].length, static_cast<int>(i)});
         }
@@ -84,6 +92,7 @@ class BufferRangeIndex {
     bool empty() const { return by_start_.empty(); }
     bool overlaps() const { return overlaps_; }
     size_t size() const { return by_start_.size(); }
+    size_t sourceSize() const { return source_size_; }
 
     // Position in the original buffer list of the MR covering
     // [addr, addr + length), or -1 when there is none. Overlapping lists
@@ -116,6 +125,7 @@ class BufferRangeIndex {
 
     std::vector<Entry> by_start_;
     bool overlaps_ = false;
+    size_t source_size_ = 0;
 };
 
 }  // namespace mooncake
