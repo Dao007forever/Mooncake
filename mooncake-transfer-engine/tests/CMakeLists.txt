@@ -397,6 +397,8 @@ add_test(NAME rdma_context_reprobe_test COMMAND rdma_context_reprobe_test)
 
 add_executable(rdma_transport_submit_task_test
                ${WORKSPACE}/rdma_transport_submit_task_test.cpp)
+target_include_directories(rdma_transport_submit_task_test
+                           PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(rdma_transport_submit_task_test PUBLIC transfer_engine
                                                              gtest gtest_main)
 add_test(NAME rdma_transport_submit_task_test
@@ -500,7 +502,13 @@ endif()
 # Fake verbs cover MR-size overrides, metadata and rollback without RDMA
 # hardware.
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
-  add_executable(rdma_mr_override_test ${WORKSPACE}/rdma_mr_override_test.cpp)
+  # --wrap only rewrites references at the final link, not inside an already
+  # linked shared library. Include the RDMA objects directly so the fake verbs
+  # also intercept registration when BUILD_SHARED_LIBS is ON.
+  add_executable(rdma_mr_override_test ${WORKSPACE}/rdma_mr_override_test.cpp
+                                       $<TARGET_OBJECTS:rdma_transport>)
+  target_include_directories(rdma_mr_override_test
+                             PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
   target_link_libraries(rdma_mr_override_test PRIVATE transfer_engine gtest
                                                       gtest_main)
   target_link_options(rdma_mr_override_test PRIVATE "-Wl,--wrap=ibv_reg_mr"
