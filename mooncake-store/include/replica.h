@@ -118,7 +118,8 @@ struct ReplicateConfig {
         preferred_nof_segments{};  // Preferred NoF segments for allocation
     bool prefer_alloc_in_same_node{false};
     ObjectDataType data_type{ObjectDataType::UNKNOWN};
-    std::string host_id{};
+    // Optional on the wire; peers with the same base layout may omit host_id.
+    struct_pack::compatible<std::string, 20260702> host_id{};
     // Optional per-key group IDs. Empty string keeps that key
     // ungrouped. Group IDs tie keys into a lifecycle group: the background
     // eviction treats the group as a unit (all-or-none). Object routing is
@@ -166,8 +167,8 @@ struct ReplicateConfig {
         os << ", prefer_alloc_in_same_node: "
            << config.prefer_alloc_in_same_node
            << ", data_type: " << config.data_type;
-        if (!config.host_id.empty()) {
-            os << ", host_id: " << config.host_id;
+        if (config.host_id.has_value() && !config.host_id->empty()) {
+            os << ", host_id: " << *config.host_id;
         }
         if (config.group_ids.has_value()) {
             os << ", group_ids: [";

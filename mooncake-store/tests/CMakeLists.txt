@@ -42,6 +42,8 @@ add_store_test(runtime_accelerator_test runtime_accelerator_test.cpp)
 add_store_test(registered_pinned_memory_test registered_pinned_memory_test.cpp)
 add_store_test(allocation_strategy_test allocation_strategy_test.cpp)
 add_store_test(replica_selection_test replica_selection_test.cpp)
+add_store_test(replicate_config_compatibility_test
+               replicate_config_compatibility_test.cpp)
 add_store_test(replica_selection_config_test replica_selection_config_test.cpp)
 set_tests_properties(replica_selection_test
                      PROPERTIES ENVIRONMENT "MC_STORE_REPLICA_SCORING=0")

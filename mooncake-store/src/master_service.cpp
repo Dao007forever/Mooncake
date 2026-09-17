@@ -4663,13 +4663,14 @@ auto MasterService::PutStart(const UUID& client_id, const std::string& key,
         return tl::make_unexpected(soft_pin_request.error());
     }
 
-    UpdateClientHostId(client_id, config.host_id);
+    UpdateClientHostId(client_id, config.host_id.value_or(std::string{}));
     std::string writer_host_id;
     if ((allocation_strategy_type_ == AllocationStrategyType::LOCAL_FIRST ||
          config.prefer_alloc_in_same_node) &&
         config.replica_num == 1) {
-        writer_host_id = config.host_id.empty() ? GetClientHostId(client_id)
-                                                : config.host_id;
+        writer_host_id = !config.host_id.has_value() || config.host_id->empty()
+                             ? GetClientHostId(client_id)
+                             : *config.host_id;
     }
 
     if ((memory_allocator_type_ == BufferAllocatorType::CACHELIB) &&
@@ -5307,13 +5308,14 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
         return tl::make_unexpected(soft_pin_request.error());
     }
 
-    UpdateClientHostId(client_id, config.host_id);
+    UpdateClientHostId(client_id, config.host_id.value_or(std::string{}));
     std::string writer_host_id;
     if ((allocation_strategy_type_ == AllocationStrategyType::LOCAL_FIRST ||
          config.prefer_alloc_in_same_node) &&
         config.replica_num == 1) {
-        writer_host_id = config.host_id.empty() ? GetClientHostId(client_id)
-                                                : config.host_id;
+        writer_host_id = !config.host_id.has_value() || config.host_id->empty()
+                             ? GetClientHostId(client_id)
+                             : *config.host_id;
     }
 
     if ((memory_allocator_type_ == BufferAllocatorType::CACHELIB) &&
