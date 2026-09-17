@@ -361,3 +361,41 @@ TEST(BufferRangeIndex, SelectDeviceMatchesLinearFirstMatch) {
     }
     EXPECT_GE(compared, 100000);
 }
+
+#ifdef ENABLE_MULTI_PROTOCOL
+TEST(BufferRangeIndex, HipAliasesPreserveRdmaIndexAndOriginalIndices) {
+    auto hip = MakeBuffer(0x1000, 0x3000, 0);
+    hip.protocol = "hip";
+    hip.lkey.clear();
+    hip.rkey.clear();
+    auto first = MakeBuffer(0x1000, 0x1000, 1);
+    first.protocol = "rdma";
+    auto second = MakeBuffer(0x2000, 0x1000, 2);
+    second.protocol = "rdma";
+    auto desc = MakeSegment({hip, first, second});
+    ASSERT_FALSE(desc.buffer_range_index.overlaps());
+    ASSERT_EQ(desc.buffer_range_index.size(), 2U);
+    ASSERT_EQ(desc.buffer_range_index.sourceSize(), 3U);
+    EXPECT_EQ(desc.buffer_range_index.findCovering(0x1080, 16), 1);
+    EXPECT_EQ(desc.buffer_range_index.findCovering(0x2080, 16), 2);
+    EXPECT_EQ(desc.buffer_range_index.findCovering(0x3080, 16), -1);
+    int buffer = -1, device = -1;
+    ASSERT_EQ(RdmaTransport::selectDevice(&desc, 0x2080, 16, buffer, device),
+              0);
+    EXPECT_EQ(buffer, 2);
+    desc.buffers.push_back(MakeBuffer(0x3000, 0x1000, 3));
+    // A stale filtered index must still fall back to the original scan.
+    ASSERT_EQ(RdmaTransport::selectDevice(&desc, 0x3080, 16, buffer, device),
+              0);
+    EXPECT_EQ(buffer, 3);
+    desc.rebuildBufferRangeIndex();
+    EXPECT_EQ(desc.buffer_range_index.findCovering(0x3080, 16), 3);
+    desc.buffers.push_back(MakeBuffer(0x1800, 0x1000, 4));
+    desc.rebuildBufferRangeIndex();
+    EXPECT_TRUE(desc.buffer_range_index.overlaps());
+    ASSERT_EQ(
+        RdmaTransport::selectDevice(&desc, 0x1900, 16, buffer, device, 0, 4),
+        0);
+    EXPECT_EQ(buffer, 1);
+}
+#endif

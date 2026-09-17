@@ -66,7 +66,7 @@ static const BufferRangeIndex *uniqueCoverageIndex(
     const TransferMetadata::SegmentDesc *desc) {
     if (!desc) return nullptr;
     const BufferRangeIndex &index = desc->buffer_range_index;
-    if (index.size() != desc->buffers.size() || index.overlaps())
+    if (index.sourceSize() != desc->buffers.size() || index.overlaps())
         return nullptr;
     return &index;
 }
