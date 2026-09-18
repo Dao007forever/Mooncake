@@ -750,10 +750,9 @@ void WorkerPool::performPostSend(int thread_id) {
             }
             continue;
         }
-        // Set endpoint pointer for each slice before submitting
-        for (auto &slice : entry.second) {
-            slice->rdma.endpoint = endpoint.get();
-        }
+        // The endpoint pointer is set per posted slice inside
+        // submitPostSend(); walking the whole pending queue here is O(N)
+        // per worker iteration and dominated large-batch post time.
         endpoint->submitPostSend(entry.second, failed_slice_list);
 #endif
     }

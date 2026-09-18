@@ -1101,6 +1101,7 @@ int RdmaEndPoint::submitPostSend(
             wr.wr.rdma.rkey = slice->rdma.dest_rkey;
             slice->ts = getCurrentTimeInNano();
             slice->status = Transport::Slice::POSTED;
+            slice->rdma.endpoint = this;
             slice->rdma.qp_depth = &wr_depth_list_[qp_index];
             slice->rdma.qp_index = static_cast<int>(qp_index);
             slice->rdma.signaled = sig[static_cast<size_t>(i)];
