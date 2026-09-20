@@ -276,6 +276,10 @@ void WorkerPool::enqueueSlicesToOwner(int owner_thread,
         if (dst == nullptr || last_path != &path) {
             last_path = &path;
             dst = &queues[path];
+            // One reservation per path run instead of doubling reallocs
+            // (and memmove of the queue) while a large batch drains.
+            if (dst->capacity() < dst->size() + slices.size())
+                dst->reserve(dst->size() + slices.size());
         }
         dst->push_back(slice);
     }
@@ -560,7 +564,9 @@ void WorkerPool::enqueuePreparedSlices(const SliceList &slice_list,
             processed_slice_count_.fetch_add(1);
             continue;
         }
-        by_owner[static_cast<size_t>(owner_thread)].push_back(slice);
+        auto &dst = by_owner[static_cast<size_t>(owner_thread)];
+        if (dst.empty()) dst.reserve(slice_list.size());
+        dst.push_back(slice);
     }
     for (int owner_thread = 0; owner_thread < worker_count_; ++owner_thread) {
         enqueueSlicesToOwner(owner_thread,

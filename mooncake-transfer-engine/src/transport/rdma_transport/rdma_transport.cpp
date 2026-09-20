@@ -965,7 +965,20 @@ Status RdmaTransport::submitTransferTask(
         }
     } local_hit;
 
+    // slice_count is published once per task (or before each flush) instead
+    // of one full-barrier atomic per slice. Every slice is counted before it
+    // becomes visible to a worker, so completion accounting is unchanged.
+    TransferTask *pending_task = nullptr;
+    uint64_t pending_slices = 0;
+    auto commit_pending = [&]() {
+        if (pending_slices) {
+            __atomic_fetch_add(&pending_task->slice_count, pending_slices,
+                               __ATOMIC_ACQ_REL);
+            pending_slices = 0;
+        }
+    };
     auto flush_slices = [&]() {
+        commit_pending();
         if (!has_slices_to_post) return;
         for (size_t dev = 0; dev < slices_to_post.size(); ++dev) {
             auto &list = slices_to_post[dev];
@@ -1003,6 +1016,7 @@ Status RdmaTransport::submitTransferTask(
     };
     auto fail_task_and_cleanup = [&](TransferTask &task, Slice *slice,
                                      size_t task_index) {
+        commit_pending();
         task.total_bytes += slice->length;
         __sync_fetch_and_add(&task.slice_count, 1);
         slice->markFailed();
@@ -1020,6 +1034,10 @@ Status RdmaTransport::submitTransferTask(
         assert(task_list[task_index]);
         auto &task = *task_list[task_index];
         const size_t current_task_index = task_index;
+        if (pending_task != &task) {
+            commit_pending();
+            pending_task = &task;
+        }
         nr_slices = 0;
         assert(task.request);
         auto &request = task.request[request_index++];
@@ -1079,6 +1097,8 @@ Status RdmaTransport::submitTransferTask(
                                          target_segment_desc.get(),
                                          &last_local_buffer_id,
                                          &last_remote_buffer_id};
+        task.slice_list.reserve(task.slice_list.size() +
+                                (request.length + kBlockSize - 1) / kBlockSize);
         for (uint64_t offset = 0; offset < request.length;) {
             size_t slice_length = slice_calc.calculate(offset);
 
@@ -1163,10 +1183,12 @@ Status RdmaTransport::submitTransferTask(
                         local_segment_desc->buffers[buffer_id],
                         reinterpret_cast<uint64_t>(slice->source_addr));
                 }
-                slices_to_post[device_id].push_back(slice);
+                auto &post_list = slices_to_post[device_id];
+                if (post_list.empty()) post_list.reserve(kSubmitWatermark);
+                post_list.push_back(slice);
                 has_slices_to_post = true;
                 task.total_bytes += slice->length;
-                __sync_fetch_and_add(&task.slice_count, 1);
+                pending_slices++;
             }
 
             if (nr_slices >= kSubmitWatermark) {
@@ -1179,6 +1201,7 @@ Status RdmaTransport::submitTransferTask(
     }
 
     flush_slices();
+    commit_pending();
     return Status::OK();
 }
 
