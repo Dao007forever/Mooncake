@@ -346,13 +346,36 @@ int WorkerPool::submitPostSend(
 
     SubmissionNicPaths nic_paths;
     SliceList prepared_slice_list;
+    prepared_slice_list.reserve(slice_list.size());
     uint64_t submitted_slice_count = 0;
     thread_local std::unordered_map<int, uint64_t> failed_target_ids;
     int last_buffer_id = -1;
     int last_device_id = -1;
     SegmentID last_target_id = static_cast<SegmentID>(-1);
+    std::shared_ptr<RdmaTransport::SegmentDesc> *peer_desc_slot = nullptr;
+    // Consecutive slices into the same remote MR reuse the previous
+    // (buffer, device, rkey, rail) instead of re-running selectPeerDevice and
+    // the string-keyed rail lookups. The NUMA-segmented "segments:" buffers
+    // pick the device by offset and are never cached. Rail health is
+    // re-checked at the next MR change or the next submit call; a rail that
+    // fails in between is handled by the worker's redispatch path.
+    struct {
+        int buffer_id = -1, device_id = -1;
+        uint64_t begin = 0, end = 0;
+        Transport::Slice::mr_key_t rkey = 0;
+        std::shared_ptr<const std::string> nic_path;
+        bool covers(uint64_t addr, size_t len) const {
+            return buffer_id >= 0 && addr >= begin && len <= end - addr;
+        }
+        void reset() {
+            buffer_id = device_id = -1;
+            begin = end = 0;
+            nic_path.reset();
+        }
+    } remote_hit;
     for (auto &slice : slice_list) {
-        if (failed_target_ids.count(slice->target_id)) {
+        if (!failed_target_ids.empty() &&
+            failed_target_ids.count(slice->target_id)) {
             auto ts = failed_target_ids[slice->target_id];
             if (getCurrentTimeInNano() - ts < 100000000ull) {
                 slice->markFailed();
@@ -361,13 +384,22 @@ int WorkerPool::submitPostSend(
                 failed_target_ids.erase(slice->target_id);
             }
         }
-        auto &peer_segment_desc = segment_desc_map[slice->target_id];
-        int buffer_id, device_id;
-        if (slice->target_id != last_target_id) {
+        if (slice->target_id != last_target_id || !peer_desc_slot) {
             last_buffer_id = -1;
             last_device_id = -1;
             last_target_id = slice->target_id;
+            peer_desc_slot = &segment_desc_map[slice->target_id];
+            remote_hit.reset();
         }
+        auto &peer_segment_desc = *peer_desc_slot;
+        if (remote_hit.covers(slice->rdma.dest_addr, slice->length)) {
+            slice->rdma.dest_rkey = remote_hit.rkey;
+            slice->interned_peer_nic_path = remote_hit.nic_path;
+            prepared_slice_list.push_back(slice);
+            submitted_slice_count++;
+            continue;
+        }
+        int buffer_id, device_id;
         if (selectPeerDevice(peer_segment_desc.get(), slice->rdma.dest_addr,
                              slice->length, context_.deviceName(), buffer_id,
                              device_id, 0, last_buffer_id, last_device_id)) {
@@ -433,6 +465,20 @@ int WorkerPool::submitPostSend(
         }
 
         slice->interned_peer_nic_path = peer_nic_path;
+        {
+            const auto &buffer = peer_segment_desc->buffers[buffer_id];
+            if (!globalConfig().log_rdma_slice_affinity &&
+                buffer.name.rfind(kSegmentsLocationPrefix, 0) != 0) {
+                remote_hit.buffer_id = buffer_id;
+                remote_hit.device_id = device_id;
+                remote_hit.begin = buffer.addr;
+                remote_hit.end = buffer.addr + buffer.length;
+                remote_hit.rkey = slice->rdma.dest_rkey;
+                remote_hit.nic_path = peer_nic_path;
+            } else {
+                remote_hit.reset();
+            }
+        }
         if (globalConfig().log_rdma_slice_affinity) {
             VLOG(1) << "RDMA slice affinity: source_location="
                     << sourceLocationOrUnknown(slice) << ", target_location="
@@ -459,8 +505,17 @@ int WorkerPool::submitPostSend(
 void WorkerPool::enqueuePreparedSlices(const SliceList &slice_list,
                                        uint64_t submitted_slice_count) {
     std::vector<SliceList> by_owner(static_cast<size_t>(worker_count_));
+    const std::string *last_path = nullptr;
+    int last_owner = -1;
     for (auto *slice : slice_list) {
-        const int owner_thread = postingThreadForPeer(slice->peerNicPath());
+        // Interned peer paths share one string object, so pointer identity
+        // skips the hash lookup for runs of slices on the same rail.
+        const std::string *path = &slice->peerNicPath();
+        if (path != last_path) {
+            last_owner = postingThreadForPeer(*path);
+            last_path = path;
+        }
+        const int owner_thread = last_owner;
         if (owner_thread < 0 || owner_thread >= worker_count_) {
             LOG(ERROR) << "Invalid RDMA worker owner " << owner_thread
                        << " for peer " << slice->peerNicPath();

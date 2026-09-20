@@ -141,6 +141,9 @@ class Transport {
 #endif
         std::vector<mr_key_t> dest_rkeys;
         bool from_cache;
+        // Allocated inside a BatchDesc::slice_slabs array; freed with the
+        // batch, never returned to the thread-local cache.
+        bool from_slab = false;
 
         // Optional resource cleanup invoked exactly once before the slice is
         // deleted or returned to the thread-local cache. The callback must not
@@ -395,14 +398,26 @@ class Transport {
         // record the slice list for freeing objects
         std::vector<Slice *> slice_list;
         ~TransferTask() {
-            for (auto &slice : slice_list)
+            for (auto &slice : slice_list) {
+                if (slice->from_slab) {
+                    auto cleanup = slice->cleanup_callback;
+                    slice->cleanup_callback = nullptr;
+                    if (cleanup) cleanup(slice);
+                    slice->interned_peer_nic_path = nullptr;
+                    continue;
+                }
                 Transport::getSliceCache().deallocate(slice);
+            }
         }
     };
 
     struct BatchDesc {
         BatchID id;
         size_t batch_size;
+        // Slices allocated per submit in one array each. Declared before
+        // task_list so it is destroyed after it (reverse declaration order):
+        // ~TransferTask still reads slice->from_slab.
+        std::vector<std::unique_ptr<Slice[]>> slice_slabs;
         std::vector<TransferTask> task_list;
         void *context;  // for transport implementers.
         int64_t start_timestamp;

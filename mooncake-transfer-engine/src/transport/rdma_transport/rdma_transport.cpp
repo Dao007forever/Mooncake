@@ -866,8 +866,9 @@ Status RdmaTransport::submitTransfer(
 
 Status RdmaTransport::submitTransferTask(
     const std::vector<TransferTask *> &task_list) {
-    std::unordered_map<std::shared_ptr<RdmaContext>, std::vector<Slice *>>
-        slices_to_post;
+    // Indexed by local device id: no hash lookup per slice.
+    std::vector<std::vector<Slice *>> slices_to_post(context_list_.size());
+    bool has_slices_to_post = false;
     std::unordered_map<SegmentID, std::shared_ptr<SegmentDesc>>
         target_segment_descs;
     auto local_segment_desc = metadata_->getSegmentDescByID(LOCAL_SEGMENT_ID);
@@ -877,10 +878,79 @@ Status RdmaTransport::submitTransferTask(
     const size_t kFragmentSize = globalConfig().fragment_limit;
     const size_t kSubmitWatermark =
         globalConfig().max_wr * globalConfig().num_qp_per_ep;
+
+    // Slices live until the batch is freed (task.slice_list), so allocate
+    // them in one array owned by the BatchDesc instead of one heap object
+    // each. The thread-local cache only sees the overflow when a request is
+    // split at MR boundaries more often than estimated.
+    size_t estimated_slices = 0;
+    for (auto *task : task_list) {
+        for (size_t i = 0; i < task->request_count; ++i) {
+            const auto &req = task->request[i];
+            estimated_slices += (req.length + kBlockSize - 1) / kBlockSize;
+        }
+    }
+    Slice *slab = nullptr;
+    size_t slab_used = 0, slab_size = 0;
+    if (!task_list.empty() && estimated_slices > 0) {
+        slab_size = estimated_slices + estimated_slices / 64 + 16;
+        auto &batch_desc = toBatchDesc(task_list[0]->batch_id);
+        batch_desc.slice_slabs.emplace_back(new Slice[slab_size]());
+        slab = batch_desc.slice_slabs.back().get();
+    }
+    auto allocate_slice = [&]() -> Slice * {
+        if (slab_used < slab_size) {
+            Slice *slice = &slab[slab_used++];
+            slice->from_slab = true;
+            slice->from_cache = false;
+            return slice;
+        }
+        return getSliceCache().allocate();
+    };
+
+    // Consecutive requests almost always fall in the same local MR. Reuse
+    // its (buffer, device) pick instead of re-running selectDevice, whose
+    // hint path still does string-keyed topology lookups per call. The
+    // NUMA-segmented "segments:" buffers pick the device by offset and are
+    // never cached.
+    struct ResolvedBuffer {
+        int buffer_id = -1, device_id = -1;
+        uint64_t begin = 0, end = 0;
+        bool covers(uint64_t addr, size_t len) const {
+            return buffer_id >= 0 && addr >= begin && len <= end - addr;
+        }
+        void set(const TransferMetadata::BufferDesc &b, int bid, int did) {
+            if (b.name.rfind(kSegmentsLocationPrefix, 0) == 0) {
+                reset();
+                return;
+            }
+            buffer_id = bid;
+            device_id = did;
+            begin = b.addr;
+            end = b.addr + b.length;
+        }
+        void reset() {
+            buffer_id = device_id = -1;
+            begin = end = 0;
+        }
+    } local_hit;
+
+    auto flush_slices = [&]() {
+        if (!has_slices_to_post) return;
+        for (size_t dev = 0; dev < slices_to_post.size(); ++dev) {
+            auto &list = slices_to_post[dev];
+            if (list.empty()) continue;
+            context_list_[dev]->submitPostSend(list);
+            list.clear();
+        }
+        has_slices_to_post = false;
+    };
     auto fail_unposted_slices = [&]() {
-        for (auto &entry : slices_to_post)
-            for (auto *slice : entry.second) slice->markFailed();
-        slices_to_post.clear();
+        for (auto &list : slices_to_post) {
+            for (auto *slice : list) slice->markFailed();
+            list.clear();
+        }
+        has_slices_to_post = false;
     };
 
     // Fabricate a zero-length failed slice for unstarted tasks so that the
@@ -890,7 +960,7 @@ Status RdmaTransport::submitTransferTask(
     auto fail_unstarted_tasks = [&](size_t first_task_index) {
         for (size_t i = first_task_index; i < task_list.size(); ++i) {
             auto &task = *task_list[i];
-            Slice *slice = getSliceCache().allocate();
+            Slice *slice = allocate_slice();
             assert(slice);
             slice->source_addr = nullptr;
             slice->length = 0;
@@ -942,20 +1012,32 @@ Status RdmaTransport::submitTransferTask(
         }
 
         auto request_buffer_id = -1, request_device_id = -1;
-        const int local_hint_device_id =
-            last_local_device_buffer_id == last_local_buffer_id
-                ? last_local_device_id
-                : -1;
-        if (selectDevice(local_segment_desc.get(), (uint64_t)request.source,
-                         request.length, request_buffer_id, request_device_id,
-                         0, last_local_buffer_id, local_hint_device_id,
-                         false)) {
-            request_buffer_id = -1;
-            request_device_id = -1;
+        if (local_hit.covers(reinterpret_cast<uint64_t>(request.source),
+                             request.length) &&
+            context_list_[local_hit.device_id] &&
+            context_list_[local_hit.device_id]->active()) {
+            request_buffer_id = local_hit.buffer_id;
+            request_device_id = local_hit.device_id;
         } else {
-            last_local_buffer_id = request_buffer_id;
-            last_local_device_id = request_device_id;
-            last_local_device_buffer_id = request_buffer_id;
+            const int local_hint_device_id =
+                last_local_device_buffer_id == last_local_buffer_id
+                    ? last_local_device_id
+                    : -1;
+            if (selectDevice(local_segment_desc.get(),
+                             (uint64_t)request.source, request.length,
+                             request_buffer_id, request_device_id, 0,
+                             last_local_buffer_id, local_hint_device_id,
+                             false)) {
+                request_buffer_id = -1;
+                request_device_id = -1;
+                local_hit.reset();
+            } else {
+                last_local_buffer_id = request_buffer_id;
+                last_local_device_id = request_device_id;
+                last_local_device_buffer_id = request_buffer_id;
+                local_hit.set(local_segment_desc->buffers[request_buffer_id],
+                              request_buffer_id, request_device_id);
+            }
         }
 
         SliceLengthCalculator slice_calc{request,
@@ -968,7 +1050,7 @@ Status RdmaTransport::submitTransferTask(
         for (uint64_t offset = 0; offset < request.length;) {
             size_t slice_length = slice_calc.calculate(offset);
 
-            Slice *slice = getSliceCache().allocate();
+            Slice *slice = allocate_slice();
             assert(slice);
             if (!slice->from_cache) {
                 nr_slices++;
@@ -1049,15 +1131,14 @@ Status RdmaTransport::submitTransferTask(
                         local_segment_desc->buffers[buffer_id],
                         reinterpret_cast<uint64_t>(slice->source_addr));
                 }
-                slices_to_post[context].push_back(slice);
+                slices_to_post[device_id].push_back(slice);
+                has_slices_to_post = true;
                 task.total_bytes += slice->length;
                 __sync_fetch_and_add(&task.slice_count, 1);
             }
 
             if (nr_slices >= kSubmitWatermark) {
-                for (auto &entry : slices_to_post)
-                    entry.first->submitPostSend(entry.second);
-                slices_to_post.clear();
+                flush_slices();
                 nr_slices = 0;
             }
 
@@ -1065,8 +1146,7 @@ Status RdmaTransport::submitTransferTask(
         }
     }
 
-    for (auto &entry : slices_to_post)
-        if (!entry.second.empty()) entry.first->submitPostSend(entry.second);
+    flush_slices();
     return Status::OK();
 }
 
