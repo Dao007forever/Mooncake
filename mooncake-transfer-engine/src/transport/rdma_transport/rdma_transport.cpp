@@ -909,29 +909,56 @@ Status RdmaTransport::submitTransferTask(
     };
 
     // Consecutive requests almost always fall in the same local MR. Reuse
-    // its (buffer, device) pick instead of re-running selectDevice, whose
-    // hint path still does string-keyed topology lookups per call. The
-    // NUMA-segmented "segments:" buffers pick the device by offset and are
-    // never cached.
+    // its device pick instead of re-running selectDevice, whose hint path
+    // still does string-keyed topology lookups per call. A NUMA-segmented
+    // "segments:" buffer picks the device per region (resolveSegmentsLocation),
+    // so it gets one slot per region; other buffers get one slot.
     struct ResolvedBuffer {
-        int buffer_id = -1, device_id = -1;
+        int buffer_id = -1;
         uint64_t begin = 0, end = 0;
-        bool covers(uint64_t addr, size_t len) const {
-            return buffer_id >= 0 && addr >= begin && len <= end - addr;
+        size_t region_size = 0;
+        std::vector<int> device_by_region;
+        void reset() {
+            buffer_id = -1;
+            begin = end = 0;
+            region_size = 0;
+            device_by_region.clear();
         }
-        void set(const TransferMetadata::BufferDesc &b, int bid, int did) {
-            if (b.name.rfind(kSegmentsLocationPrefix, 0) == 0) {
-                reset();
-                return;
-            }
+        // Region of [addr, addr+len) when it lies inside the buffer and does
+        // not straddle a region boundary; -1 otherwise. Mirrors the clamp in
+        // resolveSegmentsLocation for the tail bytes.
+        int region(uint64_t addr, size_t len) const {
+            if (buffer_id < 0 || addr < begin || len > end - addr) return -1;
+            const size_t n = device_by_region.size();
+            if (n == 1) return 0;
+            size_t first = (addr - begin) / region_size;
+            size_t last = (addr + len - 1 - begin) / region_size;
+            if (first >= n) first = n - 1;
+            if (last >= n) last = n - 1;
+            return first == last ? static_cast<int>(first) : -1;
+        }
+        int lookup(uint64_t addr, size_t len) const {
+            const int r = region(addr, len);
+            return r < 0 ? -1 : device_by_region[r];
+        }
+        void bind(const TransferMetadata::BufferDesc &b, int bid) {
+            if (buffer_id == bid) return;
+            reset();
             buffer_id = bid;
-            device_id = did;
             begin = b.addr;
             end = b.addr + b.length;
+            size_t n = 1;
+            SegmentsLocationInfo info;
+            if (parseSegmentsLocation(b.name, info) && !info.numa_nodes.empty() &&
+                b.length / info.numa_nodes.size() > 0) {
+                n = info.numa_nodes.size();
+            }
+            region_size = b.length / n;
+            device_by_region.assign(n, -1);
         }
-        void reset() {
-            buffer_id = device_id = -1;
-            begin = end = 0;
+        void remember(uint64_t addr, size_t len, int did) {
+            const int r = region(addr, len);
+            if (r >= 0) device_by_region[r] = did;
         }
     } local_hit;
 
@@ -1012,12 +1039,12 @@ Status RdmaTransport::submitTransferTask(
         }
 
         auto request_buffer_id = -1, request_device_id = -1;
-        if (local_hit.covers(reinterpret_cast<uint64_t>(request.source),
-                             request.length) &&
-            context_list_[local_hit.device_id] &&
-            context_list_[local_hit.device_id]->active()) {
+        const int cached_device = local_hit.lookup(
+            reinterpret_cast<uint64_t>(request.source), request.length);
+        if (cached_device >= 0 && context_list_[cached_device] &&
+            context_list_[cached_device]->active()) {
             request_buffer_id = local_hit.buffer_id;
-            request_device_id = local_hit.device_id;
+            request_device_id = cached_device;
         } else {
             const int local_hint_device_id =
                 last_local_device_buffer_id == last_local_buffer_id
@@ -1035,8 +1062,10 @@ Status RdmaTransport::submitTransferTask(
                 last_local_buffer_id = request_buffer_id;
                 last_local_device_id = request_device_id;
                 last_local_device_buffer_id = request_buffer_id;
-                local_hit.set(local_segment_desc->buffers[request_buffer_id],
-                              request_buffer_id, request_device_id);
+                local_hit.bind(local_segment_desc->buffers[request_buffer_id],
+                               request_buffer_id);
+                local_hit.remember(reinterpret_cast<uint64_t>(request.source),
+                                   request.length, request_device_id);
             }
         }
 

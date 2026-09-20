@@ -354,23 +354,63 @@ int WorkerPool::submitPostSend(
     SegmentID last_target_id = static_cast<SegmentID>(-1);
     std::shared_ptr<RdmaTransport::SegmentDesc> *peer_desc_slot = nullptr;
     // Consecutive slices into the same remote MR reuse the previous
-    // (buffer, device, rkey, rail) instead of re-running selectPeerDevice and
-    // the string-keyed rail lookups. The NUMA-segmented "segments:" buffers
-    // pick the device by offset and are never cached. Rail health is
-    // re-checked at the next MR change or the next submit call; a rail that
-    // fails in between is handled by the worker's redispatch path.
-    struct {
-        int buffer_id = -1, device_id = -1;
-        uint64_t begin = 0, end = 0;
+    // (device, rkey, rail) instead of re-running selectPeerDevice and the
+    // string-keyed rail lookups. A NUMA-segmented "segments:" buffer picks the
+    // device per region (resolveSegmentsLocation), so it gets one slot per
+    // region; other buffers get one slot. Rail health is re-checked at the
+    // next MR change or the next submit call; a rail that fails in between is
+    // handled by the worker's redispatch path.
+    struct RemoteSlot {
+        int device_id = -1;
         Transport::Slice::mr_key_t rkey = 0;
         std::shared_ptr<const std::string> nic_path;
-        bool covers(uint64_t addr, size_t len) const {
-            return buffer_id >= 0 && addr >= begin && len <= end - addr;
-        }
+    };
+    struct {
+        int buffer_id = -1;
+        uint64_t begin = 0, end = 0;
+        size_t region_size = 0;
+        std::vector<RemoteSlot> slots;
         void reset() {
-            buffer_id = device_id = -1;
+            buffer_id = -1;
             begin = end = 0;
-            nic_path.reset();
+            region_size = 0;
+            slots.clear();
+        }
+        int region(uint64_t addr, size_t len) const {
+            if (buffer_id < 0 || addr < begin || len > end - addr) return -1;
+            const size_t n = slots.size();
+            if (n == 1) return 0;
+            size_t first = (addr - begin) / region_size;
+            size_t last = (addr + len - 1 - begin) / region_size;
+            if (first >= n) first = n - 1;
+            if (last >= n) last = n - 1;
+            return first == last ? static_cast<int>(first) : -1;
+        }
+        const RemoteSlot *lookup(uint64_t addr, size_t len) const {
+            const int r = region(addr, len);
+            if (r < 0 || slots[r].device_id < 0) return nullptr;
+            return &slots[r];
+        }
+        void bind(const TransferMetadata::BufferDesc &b, int bid) {
+            if (buffer_id == bid) return;
+            reset();
+            buffer_id = bid;
+            begin = b.addr;
+            end = b.addr + b.length;
+            size_t n = 1;
+            SegmentsLocationInfo info;
+            if (parseSegmentsLocation(b.name, info) && !info.numa_nodes.empty() &&
+                b.length / info.numa_nodes.size() > 0) {
+                n = info.numa_nodes.size();
+            }
+            region_size = b.length / n;
+            slots.assign(n, RemoteSlot{});
+        }
+        void remember(uint64_t addr, size_t len, int did,
+                      Transport::Slice::mr_key_t rkey,
+                      std::shared_ptr<const std::string> path) {
+            const int r = region(addr, len);
+            if (r >= 0) slots[r] = RemoteSlot{did, rkey, std::move(path)};
         }
     } remote_hit;
     for (auto &slice : slice_list) {
@@ -392,9 +432,10 @@ int WorkerPool::submitPostSend(
             remote_hit.reset();
         }
         auto &peer_segment_desc = *peer_desc_slot;
-        if (remote_hit.covers(slice->rdma.dest_addr, slice->length)) {
-            slice->rdma.dest_rkey = remote_hit.rkey;
-            slice->interned_peer_nic_path = remote_hit.nic_path;
+        if (const auto *hit =
+                remote_hit.lookup(slice->rdma.dest_addr, slice->length)) {
+            slice->rdma.dest_rkey = hit->rkey;
+            slice->interned_peer_nic_path = hit->nic_path;
             prepared_slice_list.push_back(slice);
             submitted_slice_count++;
             continue;
@@ -465,19 +506,12 @@ int WorkerPool::submitPostSend(
         }
 
         slice->interned_peer_nic_path = peer_nic_path;
-        {
-            const auto &buffer = peer_segment_desc->buffers[buffer_id];
-            if (!globalConfig().log_rdma_slice_affinity &&
-                buffer.name.rfind(kSegmentsLocationPrefix, 0) != 0) {
-                remote_hit.buffer_id = buffer_id;
-                remote_hit.device_id = device_id;
-                remote_hit.begin = buffer.addr;
-                remote_hit.end = buffer.addr + buffer.length;
-                remote_hit.rkey = slice->rdma.dest_rkey;
-                remote_hit.nic_path = peer_nic_path;
-            } else {
-                remote_hit.reset();
-            }
+        if (!globalConfig().log_rdma_slice_affinity) {
+            remote_hit.bind(peer_segment_desc->buffers[buffer_id], buffer_id);
+            remote_hit.remember(slice->rdma.dest_addr, slice->length, device_id,
+                                slice->rdma.dest_rkey, peer_nic_path);
+        } else {
+            remote_hit.reset();
         }
         if (globalConfig().log_rdma_slice_affinity) {
             VLOG(1) << "RDMA slice affinity: source_location="
