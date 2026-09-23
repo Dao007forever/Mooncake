@@ -377,7 +377,10 @@ int WorkerPool::submitPostSend(
             slots.clear();
         }
         int region(uint64_t addr, size_t len) const {
-            if (buffer_id < 0 || addr < begin || len > end - addr) return -1;
+            // addr <= end must be checked before end - addr: an address past
+            // the buffer would wrap the subtraction and reuse this MR's key.
+            if (buffer_id < 0 || addr < begin || addr > end || len > end - addr)
+                return -1;
             const size_t n = slots.size();
             if (n == 1) return 0;
             size_t first = (addr - begin) / region_size;
