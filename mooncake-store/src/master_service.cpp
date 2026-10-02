@@ -3483,7 +3483,7 @@ tl::expected<void, ErrorCode> MasterService::RestoreFromStandbyState(
         }
 
         for (const auto& [shard_idx, shard_objects] : objects_by_shard) {
-            MetadataShardAccessorRW shard(this, shard_idx);
+            MetadataShardAccessorRO shard(this, shard_idx);
             for (const auto& object : shard_objects) {
                 auto tenant = shard->tenants.find(object.tenant_id);
                 if (tenant != shard->tenants.end() &&
@@ -10339,7 +10339,7 @@ MasterService::EvictTenantMemoryForQuota(const TenantId& tenant_id,
             // order).
             std::vector<std::string> candidate_keys;
             {
-                MetadataShardAccessorRW shard(this, shard_idx);
+                MetadataShardAccessorRO shard(this, shard_idx);
                 auto tenant_it = shard->tenants.find(normalized_tenant);
                 if (tenant_it == shard->tenants.end()) {
                     continue;
@@ -10796,11 +10796,14 @@ void MasterService::BatchEvict(double evict_ratio_target,
             size_t s_start = t * shards_per_thread;
             size_t s_end = std::min(s_start + shards_per_thread, kNumShards);
             for (size_t s = s_start; s < s_end; s++) {
-                MetadataShardAccessorRW shard(this, s);
-                DiscardExpiredProcessingReplicas(shard, now);
+                {
+                    MetadataShardAccessorRW shard(this, s);
+                    DiscardExpiredProcessingReplicas(shard, now);
+                }
 
                 size_t shard_metadata_count = 0;
                 size_t shard_evictable_count = 0;
+                MetadataShardAccessorRO shard(this, s);
                 for (const auto& [tenant_id, tenant_state] : shard->tenants) {
                     shard_metadata_count += tenant_state.metadata.size();
                     for (auto it = tenant_state.metadata.begin();
@@ -10906,7 +10909,7 @@ void MasterService::BatchEvict(double evict_ratio_target,
                 size_t s_end =
                     std::min(s_start + shards_per_thread, kNumShards);
                 for (size_t s = s_start; s < s_end; s++) {
-                    MetadataShardAccessorRW shard(this, s);
+                    MetadataShardAccessorRO shard(this, s);
                     for (const auto& [tenant_id, tenant_state] :
                          shard->tenants) {
                         for (const auto& [key, metadata] :
@@ -11094,7 +11097,7 @@ void MasterService::BatchEvict(double evict_ratio_target,
                 {
                     std::vector<std::pair<TenantId, std::string>> to_evict;
                     {
-                        MetadataShardAccessorRW shard(this, shard_idx);
+                        MetadataShardAccessorRO shard(this, shard_idx);
                         for (auto tenant_it = shard->tenants.begin();
                              tenant_it != shard->tenants.end(); ++tenant_it) {
                             auto& tenant_state = tenant_it->second;
@@ -11148,7 +11151,7 @@ void MasterService::BatchEvict(double evict_ratio_target,
                 {
                     std::vector<std::pair<TenantId, std::string>> to_evict;
                     {
-                        MetadataShardAccessorRW shard(this, shard_idx);
+                        MetadataShardAccessorRO shard(this, shard_idx);
                         for (auto tenant_it = shard->tenants.begin();
                              tenant_it != shard->tenants.end(); ++tenant_it) {
                             auto& tenant_state = tenant_it->second;
