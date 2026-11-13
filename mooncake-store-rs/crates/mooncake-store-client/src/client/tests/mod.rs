@@ -18747,6 +18747,7 @@ fn is_exist_evicts_unreadable_route_and_sets_version_floor() {
 
 mod adversarial;
 mod cold_tier_restore_tests;
+mod correctness_repro_tests;
 mod fault_injection_prop;
 mod lifecycle_tests;
 mod namespace_adversarial;
