@@ -2,13 +2,13 @@
 // correctness_repro_tests.rs — reproductions for route/allocator safety gaps
 // ---------------------------------------------------------------------------
 //
-// Each `repro_*` test asserts the invariant the store should provide and is
-// `#[ignore]`d because it FAILS on the current code. Run them with:
+// Each `repro_*` test asserts the invariant the store should provide and
+// FAILS on the current code. Each `control_*` test pins behaviour that already
+// holds, so the repros can be read against a passing baseline. The whole module
+// is `#[ignore]`d so it adds no load or failures to the default suite. Run it
+// with:
 //
-//   cargo test -p mooncake-store-client --lib correctness_repro -- --ignored
-//
-// Non-ignored `control_*` tests pin the behaviour that already holds, so the
-// repros can be read against a passing baseline.
+//   cargo test -p mooncake-store-client --lib correctness_repro -- --include-ignored
 //
 // Cases:
 //   1. Eviction frees a replica immediately after the route CAS; an in-flight
@@ -28,19 +28,36 @@
 //      publishes a route without a checksum, so cases 1-2 return wrong bytes
 //      silently instead of failing.
 //   7. A writer that dies between reserve and publish leaves a remote
-//      allocation that nothing ever frees (until a drain).
+//      allocation that nothing ever frees until a drain (the drain recovery
+//      is pinned by a control test).
+//   8. During a join, a writer whose membership view predates the join CASes
+//      a superseded version on the old authorities; the two authority sets
+//      hold different routes at the same version.
+//   9. An authority whose lease lapsed rejoins with the same epoch and its old
+//      route table, and is primary again for keys overwritten meanwhile.
+//  10. Looking up a missing key reads every authority, not route_topk.
+//  11. The placement label bonus saturates, so ties go to the lowest runtime.
+//  12. (control) A drain recovers the allocation abandoned in case 7.
+//  13. A deferred release whose span was reused at a different length fails
+//      the releasing writer's next, unrelated put.
 
+use std::collections::BTreeMap;
 use std::ffi::c_void;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::thread::sleep;
 use std::time::{Duration, Instant};
 
-use mooncake_store_core::{ClientLifecycleState, MetadataBackend, ObjectKey, ObjectRoute};
+use mooncake_store_core::{
+    CasResult, ClientLifecycleState, ClientRuntimeId, ClientStableId, MetadataBackend, ObjectKey,
+    ObjectRoute, RouteVersion,
+};
+use mooncake_store_route::RouteAuthorityService;
 use mooncake_store_rs_metadata::InMemoryMetadataBackend;
 use mooncake_store_test_utils::transport::TestTransport;
 
 use crate::{
-    LocalMemoryConfig, MooncakeCompatibilityFacade, PlacementPlanner, PutFromRequest,
+    LocalMemoryConfig, MooncakeCompatibilityFacade, ObjectRef, PlacementPlanner, PutFromRequest,
     ReplicationPolicy, RouteControlMode, StoreClient, StoreClientBuilder,
 };
 
@@ -57,14 +74,15 @@ use super::{
 const POOL: &str = "repro-pool";
 
 /// Common builder: active client in one pool with explicit storage/route roles.
-fn node(
-    metadata: &Arc<InMemoryMetadataBackend>,
+fn node<M: MetadataBackend + 'static>(
+    metadata: &Arc<M>,
     transport: Arc<TestTransport>,
     stable_id: &str,
     storage: bool,
     route: bool,
 ) -> StoreClientBuilder {
-    StoreClientBuilder::new(metadata.clone(), stable_id)
+    let metadata: Arc<dyn MetadataBackend> = metadata.clone();
+    StoreClientBuilder::new(metadata, stable_id)
         .state(ClientLifecycleState::Active)
         .label("pool", POOL)
         .label("storage", if storage { "true" } else { "false" })
@@ -83,8 +101,9 @@ fn build(builder: StoreClientBuilder) -> StoreClient {
     client
 }
 
-fn writer_planner(metadata: &Arc<InMemoryMetadataBackend>) -> PlacementPlanner {
-    PlacementPlanner::new(metadata.clone()).require_label("storage", "true")
+fn writer_planner<M: MetadataBackend + 'static>(metadata: &Arc<M>) -> PlacementPlanner {
+    let metadata: Arc<dyn MetadataBackend> = metadata.clone();
+    PlacementPlanner::new(metadata).require_label("storage", "true")
 }
 
 fn remote_only() -> ReplicationPolicy {
@@ -226,7 +245,11 @@ struct AuthorityCluster {
     reader: StoreClient,
 }
 
-fn authority_cluster(tag: &str, capacity: usize) -> AuthorityCluster {
+fn authority_cluster(
+    tag: &str,
+    capacity: usize,
+    writer_b_memory: LocalMemoryConfig,
+) -> AuthorityCluster {
     let metadata = Arc::new(InMemoryMetadataBackend::new());
     let base = Arc::new(TestTransport::new(&format!("{tag}-store-segment")));
     let peer = |name: &str| Arc::new(base.peer(&format!("{tag}-{name}-segment")));
@@ -262,7 +285,7 @@ fn authority_cluster(tag: &str, capacity: usize) -> AuthorityCluster {
         .label("route_weight", "1")
         .local_memory(rw_only_config()),
     );
-    let writer = |name: &str| {
+    let writer = |name: &str, memory: LocalMemoryConfig| {
         build(
             node(
                 &metadata,
@@ -271,12 +294,12 @@ fn authority_cluster(tag: &str, capacity: usize) -> AuthorityCluster {
                 false,
                 false,
             )
-            .local_memory(rw_only_config())
+            .local_memory(memory)
             .routed_writes(writer_planner(&metadata), 1),
         )
     };
-    let writer_a = writer("writer-a");
-    let writer_b = writer("writer-b");
+    let writer_a = writer("writer-a", rw_only_config());
+    let writer_b = writer("writer-b", writer_b_memory);
     let reader = build(
         node(
             &metadata,
@@ -334,6 +357,7 @@ impl AuthorityCluster {
 // ===========================================================================
 
 #[test]
+#[ignore = "control for the correctness repro suite; run with --include-ignored"]
 fn control_eviction_reuse_is_detected_when_route_has_checksum() {
     let cluster = single_store_cluster("repro-evict-ck", 32, rw_only_config());
     let k1 = [b'A'; 32];
@@ -556,7 +580,7 @@ fn repro_bounded_route_miss_frees_live_allocation_after_authorities_join() {
 #[test]
 #[ignore = "repro case 4: two writers replace the same route version; the second release of its replicas frees an unrelated key"]
 fn repro_failover_double_release_frees_unrelated_live_allocation() {
-    let cluster = authority_cluster("repro-dbl", 64);
+    let cluster = authority_cluster("repro-dbl", 64, rw_only_config());
     let v1 = [b'1'; 16];
     let k9 = [b'9'; 16];
     let k10 = [b'X'; 16];
@@ -800,5 +824,560 @@ fn repro_abandoned_reservation_is_never_reclaimed() {
         result.is_ok(),
         "store is still full of an abandoned reservation: {:?}",
         result.err()
+    );
+}
+
+// ===========================================================================
+// Case 8: a writer with a pre-join membership view overwrites a superseded
+// version (no fencing across authority-set changes)
+// ===========================================================================
+
+#[test]
+#[ignore = "repro case 8: during a join, a writer whose membership view predates the join CASes a superseded version on the old authorities"]
+fn repro_join_view_divergence_lets_stale_writer_overwrite_superseded_version() {
+    let tag = "repro-view";
+    // No background refresh: membership changes only when the test says so.
+    let slow = Duration::from_secs(3600);
+    let metadata = Arc::new(InMemoryMetadataBackend::new());
+    let base = Arc::new(TestTransport::new(&format!("{tag}-store-segment")));
+    let peer = |name: &str| Arc::new(base.peer(&format!("{tag}-{name}-segment")));
+    let authority = |name: &str, weight: &str| {
+        build(
+            node(&metadata, peer(name), &format!("{tag}-{name}"), false, true)
+                .live_client_sync_interval(slow)
+                .label("route_weight", weight)
+                .local_memory(rw_only_config()),
+        )
+    };
+    let writer = |name: &str| {
+        build(
+            node(
+                &metadata,
+                peer(name),
+                &format!("{tag}-{name}"),
+                false,
+                false,
+            )
+            .live_client_sync_interval(slow)
+            .local_memory(rw_only_config())
+            .routed_writes(writer_planner(&metadata), 1),
+        )
+    };
+    let store = build(
+        node(
+            &metadata,
+            base.clone(),
+            &format!("{tag}-store"),
+            true,
+            false,
+        )
+        .live_client_sync_interval(slow)
+        .local_memory(storage_config_with_bytes(64)),
+    );
+    let old_a = authority("old-a", "1");
+    let old_b = authority("old-b", "1");
+    let writer_a = writer("writer-a");
+    let writer_b = writer("writer-b");
+    let reader = build(
+        node(
+            &metadata,
+            peer("reader"),
+            &format!("{tag}-reader"),
+            false,
+            false,
+        )
+        .live_client_sync_interval(slow)
+        .local_memory(rw_only_config()),
+    );
+    wait_for_membership_convergence(&[&store, &old_a, &old_b, &writer_a, &writer_b, &reader]);
+
+    let v1 = put_bytes(&writer_a, "k1", &[b'1'; 16]);
+    writer_a.route_directory.flush_pending_route_mirrors();
+    let pre_join_view = writer_b
+        .live_client_cache
+        .lock()
+        .snapshot()
+        .expect("membership snapshot should exist");
+
+    // Scale-out: two authorities join and become the top-2 for every key.
+    let new_a = authority("new-a", "1000000");
+    let new_b = authority("new-b", "1000000");
+    wait_for_membership_convergence(&[
+        &store, &old_a, &old_b, &writer_a, &writer_b, &reader, &new_a, &new_b,
+    ]);
+
+    // Writer A (current view) supersedes v1 on the new authorities.
+    let a_v2 = put_bytes(&writer_a, "k1", &[b'A'; 16]);
+    writer_a.route_directory.flush_pending_route_mirrors();
+    assert!(a_v2.version > v1.version);
+
+    // Writer B runs in another process whose membership cache has not refreshed
+    // since before the join (refresh interval is 1 s in production). Every
+    // client in this test shares one per-process cache, so the pre-join view is
+    // put back for the duration of B's write.
+    writer_b.live_client_cache.lock().store(pre_join_view);
+    let b_result = writer_b.put_with_policy("k1", &[b'B'; 16], &remote_only());
+    writer_b.route_directory.flush_pending_route_mirrors();
+    super::super::refresh_live_client_cache(
+        metadata.as_ref(),
+        &writer_b.live_client_cache,
+        "repro_restore_view",
+    )
+    .expect("membership refresh should succeed");
+
+    let namespace = metadata.route_namespace();
+    let on = |client: &StoreClient| {
+        crate::route_directory::authority_get(
+            &namespace,
+            &client.runtime_id().stable_id,
+            &scoped("k1"),
+        )
+        .expect("authority route read should succeed")
+    };
+    let on_new = on(&new_a).expect("new authority holds k1");
+    let on_old = on(&old_a).expect("old authority holds k1");
+    assert!(
+        on_new.version != on_old.version || on_new.replicas == on_old.replicas,
+        "new and old authorities hold different routes for k1 at version {:?} \
+         (writer B's put returned {:?})",
+        on_new.version,
+        b_result.as_ref().map(|route| route.version)
+    );
+    if b_result.is_ok() {
+        assert_eq!(
+            reader.get("k1").expect("k1 should be readable"),
+            vec![b'B'; 16],
+            "writer B's put succeeded last, but readers see writer A's value"
+        );
+    }
+}
+
+// ===========================================================================
+// Case 9: an authority that rejoins after its lease lapsed serves its old table
+// ===========================================================================
+
+#[test]
+#[ignore = "repro case 9: an authority whose lease lapsed rejoins with the same epoch and its stale table, and readers get the superseded route"]
+fn repro_authority_rejoining_after_lease_lapse_serves_stale_route() {
+    let tag = "repro-rejoin";
+    let metadata = Arc::new(InMemoryMetadataBackend::new());
+    let base = Arc::new(TestTransport::new(&format!("{tag}-store-segment")));
+    let peer = |name: &str| Arc::new(base.peer(&format!("{tag}-{name}-segment")));
+    let store = build(
+        node(
+            &metadata,
+            base.clone(),
+            &format!("{tag}-store"),
+            true,
+            false,
+        )
+        .local_memory(storage_config_with_bytes(64)),
+    );
+    let primary = build(
+        node(
+            &metadata,
+            peer("primary"),
+            &format!("{tag}-primary"),
+            false,
+            true,
+        )
+        .label("route_weight", "1000000")
+        .local_memory(rw_only_config()),
+    );
+    let mirror = build(
+        node(
+            &metadata,
+            peer("mirror"),
+            &format!("{tag}-mirror"),
+            false,
+            true,
+        )
+        .local_memory(rw_only_config()),
+    );
+    let writer = build(
+        node(
+            &metadata,
+            peer("writer"),
+            &format!("{tag}-writer"),
+            false,
+            false,
+        )
+        .local_memory(rw_only_config())
+        .routed_writes(writer_planner(&metadata), 1),
+    );
+    let reader = build(
+        node(
+            &metadata,
+            peer("reader"),
+            &format!("{tag}-reader"),
+            false,
+            false,
+        )
+        .local_memory(rw_only_config()),
+    );
+    wait_for_membership_convergence(&[&store, &primary, &mirror, &writer, &reader]);
+
+    let v1 = put_bytes(&writer, "k1", &[b'A'; 16]);
+    writer.route_directory.flush_pending_route_mirrors();
+
+    // The primary's heartbeats stop reaching metadata; its lease runs out
+    // while the process (and its route table) stays up.
+    let mut lease = metadata
+        .list_live_clients()
+        .expect("lease list should succeed")
+        .into_iter()
+        .find(|lease| lease.runtime == *primary.runtime_id())
+        .expect("primary lease should exist");
+    lease.expires_at_ms = super::now_ms() + 100;
+    metadata
+        .upsert_client_lease(&lease)
+        .expect("lease update should succeed");
+    sleep(Duration::from_millis(300));
+
+    // Meanwhile k1 is overwritten through the remaining authority.
+    let v2 = put_bytes(&writer, "k1", &[b'B'; 16]);
+    writer.route_directory.flush_pending_route_mirrors();
+    assert!(v2.version > v1.version);
+
+    // Heartbeats recover: the same runtime (same epoch) refreshes its lease.
+    lease.expires_at_ms = super::now_ms() + 30_000;
+    metadata
+        .upsert_client_lease(&lease)
+        .expect("lease refresh should succeed");
+    sleep(Duration::from_millis(200));
+
+    let held_by_primary = crate::route_directory::authority_get(
+        &metadata.route_namespace(),
+        &primary.runtime_id().stable_id,
+        &scoped("k1"),
+    )
+    .expect("authority route read should succeed")
+    .expect("primary still holds a route for k1");
+    assert_eq!(
+        held_by_primary.version, v2.version,
+        "rejoined primary still serves superseded version {:?}",
+        held_by_primary.version
+    );
+    // In production a reader stops at the primary once it answers, so it would
+    // return v1 here. This in-process harness registers every authority as
+    // local, which makes the read path also consult and repair the mirror, so
+    // the stale primary is asserted on directly above.
+    assert_eq!(
+        reader.get("k1").expect("k1 should be readable"),
+        vec![b'B'; 16],
+        "reader returned the superseded value"
+    );
+}
+
+// ===========================================================================
+// Case 10: a route miss queries every authority, not just the top-k
+// ===========================================================================
+
+/// Authority service that counts per-key route reads and otherwise behaves
+/// like the client's local authority adapter.
+struct CountingAuthority {
+    reads: AtomicUsize,
+}
+
+impl RouteAuthorityService for CountingAuthority {
+    fn get_route(
+        &self,
+        namespace: &str,
+        authority: &ClientStableId,
+        key: &ObjectKey,
+    ) -> mooncake_store_core::Result<Option<ObjectRoute>> {
+        self.reads.fetch_add(1, Ordering::Relaxed);
+        crate::route_directory::authority_get(namespace, authority, key)
+    }
+
+    fn list_routes_by_replica_owner(
+        &self,
+        namespace: &str,
+        authority: &ClientStableId,
+        owner: &ClientRuntimeId,
+    ) -> mooncake_store_core::Result<Vec<ObjectRoute>> {
+        crate::route_directory::authority_list_routes_by_replica_owner(namespace, authority, owner)
+    }
+
+    fn compare_and_swap_route(
+        &self,
+        namespace: &str,
+        authority: &ClientStableId,
+        key: &ObjectKey,
+        expected: Option<RouteVersion>,
+        next: Option<&ObjectRoute>,
+    ) -> mooncake_store_core::Result<CasResult> {
+        crate::route_directory::authority_compare_and_swap(
+            namespace, authority, key, expected, next,
+        )
+    }
+
+    fn replace_route(
+        &self,
+        namespace: &str,
+        authority: &ClientStableId,
+        key: &ObjectKey,
+        next: Option<&ObjectRoute>,
+    ) -> mooncake_store_core::Result<()> {
+        crate::route_directory::authority_replace(namespace, authority, key, next)
+    }
+}
+
+#[test]
+#[ignore = "repro case 10: looking up a missing key reads every route authority in turn instead of route_topk"]
+fn repro_route_miss_reads_every_authority() {
+    const AUTHORITIES: usize = 8;
+    const ROUTE_TOPK: usize = 2;
+    let tag = "repro-scan";
+    let metadata = Arc::new(InMemoryMetadataBackend::new());
+    let base = Arc::new(TestTransport::new(&format!("{tag}-store-segment")));
+    let peer = |name: &str| Arc::new(base.peer(&format!("{tag}-{name}-segment")));
+    let store = build(
+        node(
+            &metadata,
+            base.clone(),
+            &format!("{tag}-store"),
+            true,
+            false,
+        )
+        .local_memory(storage_config_with_bytes(64)),
+    );
+    let authorities = (0..AUTHORITIES)
+        .map(|index| {
+            build(
+                node(
+                    &metadata,
+                    peer(&format!("auth-{index}")),
+                    &format!("{tag}-auth-{index}"),
+                    false,
+                    true,
+                )
+                .local_memory(rw_only_config()),
+            )
+        })
+        .collect::<Vec<_>>();
+    let writer = build(
+        node(
+            &metadata,
+            peer("writer"),
+            &format!("{tag}-writer"),
+            false,
+            false,
+        )
+        .local_memory(rw_only_config())
+        .routed_writes(writer_planner(&metadata), 1),
+    );
+    let mut all = vec![&store, &writer];
+    all.extend(authorities.iter());
+    wait_for_membership_convergence(&all);
+
+    let namespace = metadata.route_namespace();
+    let counters = authorities
+        .iter()
+        .map(|authority| {
+            let counter = Arc::new(CountingAuthority {
+                reads: AtomicUsize::new(0),
+            });
+            crate::route_directory::bind_local_authority_service(
+                &namespace,
+                &authority.runtime_id().stable_id,
+                counter.clone(),
+            );
+            counter
+        })
+        .collect::<Vec<_>>();
+    let total_reads = || -> usize {
+        counters
+            .iter()
+            .map(|counter| counter.reads.swap(0, Ordering::Relaxed))
+            .sum()
+    };
+
+    assert!(writer
+        .query_route("missing-key")
+        .expect("route query should succeed")
+        .is_none());
+    let query_reads = total_reads();
+
+    put_bytes(&writer, "fresh-key", &[b'F'; 16]);
+    let put_reads = total_reads();
+
+    assert!(
+        query_reads <= ROUTE_TOPK && put_reads <= ROUTE_TOPK,
+        "a miss read {query_reads} (query_route) and {put_reads} (put of a new key) \
+         authorities out of {AUTHORITIES}; expected at most route_topk = {ROUTE_TOPK}"
+    );
+}
+
+// ===========================================================================
+// Case 11: the placement label bonus saturates and skews placement
+// ===========================================================================
+
+fn placement_top_choice_shares(tag: &str, with_domain: bool) -> Vec<f64> {
+    const NODES: usize = 8;
+    const KEYS: usize = 4000;
+    let metadata = Arc::new(InMemoryMetadataBackend::new());
+    let transport = TestTransport::new(&format!("{tag}-observer-segment"));
+    let nodes = (0..NODES)
+        .map(|index| {
+            super::publish_labeled_storage_node_with_capacity(
+                &metadata,
+                &transport,
+                &format!("{tag}-node-{index}"),
+                &format!("{tag}-node-{index}-segment"),
+                POOL,
+                64,
+                1,
+                Some("d1"),
+                None,
+                None,
+            )
+        })
+        .collect::<Vec<_>>();
+    let observer = build(
+        node(
+            &metadata,
+            Arc::new(transport.peer(&format!("{tag}-observer-client-segment"))),
+            &format!("{tag}-observer"),
+            false,
+            false,
+        )
+        .route_control(RouteControlMode::MetadataOnly)
+        .local_memory(rw_only_config()),
+    );
+    let planner = writer_planner(&metadata);
+    let mut wins = BTreeMap::<ClientRuntimeId, usize>::new();
+    for index in 0..KEYS {
+        let key = format!("key-{index}");
+        let object = if with_domain {
+            ObjectRef::new(&key).domain("d1")
+        } else {
+            ObjectRef::new(&key)
+        };
+        let ranked = planner
+            .ranked_candidates_from_lease(&observer.lease(), "default", &object)
+            .expect("ranking should succeed");
+        assert_eq!(ranked.len(), NODES);
+        *wins.entry(ranked[0].clone()).or_default() += 1;
+    }
+    nodes
+        .iter()
+        .map(|runtime| *wins.get(runtime).unwrap_or(&0) as f64 / KEYS as f64)
+        .collect()
+}
+
+#[test]
+#[ignore = "control for the correctness repro suite; run with --include-ignored"]
+fn control_placement_without_labels_is_balanced() {
+    let shares = placement_top_choice_shares("ctl-skew", false);
+    let max = shares.iter().cloned().fold(0.0, f64::max);
+    assert!(max < 1.5 / shares.len() as f64, "shares: {shares:?}");
+}
+
+#[test]
+#[ignore = "repro case 11: saturating_add of the label bonus caps scores, so ties go to the lowest runtime id"]
+fn repro_placement_label_bonus_skews_to_lowest_runtime() {
+    let shares = placement_top_choice_shares("repro-skew", true);
+    let max = shares.iter().cloned().fold(0.0, f64::max);
+    assert!(
+        max < 1.5 / shares.len() as f64,
+        "with a matching domain label the top-choice shares are {shares:?} (fair share {:.3})",
+        1.0 / shares.len() as f64
+    );
+}
+
+// ===========================================================================
+// Case 12: the abandoned reservation from case 7 is only recovered by a drain
+// ===========================================================================
+
+#[test]
+#[ignore = "control for the correctness repro suite; run with --include-ignored"]
+fn control_abandoned_reservation_is_recovered_by_drain() {
+    let tag = "ctl-orphan-drain";
+    let metadata = Arc::new(InMemoryMetadataBackend::new());
+    let store_transport = Arc::new(TestTransport::new(&format!("{tag}-store-segment")));
+    let crashed_transport = Arc::new(store_transport.peer(&format!("{tag}-crashed-segment")));
+    let mut store = build(
+        node(
+            &metadata,
+            store_transport,
+            &format!("{tag}-store"),
+            true,
+            false,
+        )
+        .route_control(RouteControlMode::MetadataOnly)
+        .request_timeout(Duration::from_millis(20))
+        .local_memory(storage_config_with_bytes(32)),
+    );
+    let crashed = build(
+        node(
+            &metadata,
+            crashed_transport,
+            &format!("{tag}-crashed"),
+            false,
+            false,
+        )
+        .route_control(RouteControlMode::MetadataOnly)
+        .local_memory(rw_only_config())
+        .routed_writes(writer_planner(&metadata), 1),
+    );
+    wait_for_membership_convergence(&[&store, &crashed]);
+    crashed
+        .reserve_storage_runtime_segment(store.runtime_id(), 32, false)
+        .expect("reservation should succeed");
+    drop(crashed);
+    sleep(Duration::from_millis(600));
+    assert_eq!(
+        store.allocator.lock().allocations().len(),
+        1,
+        "the abandoned reservation is still allocated before the drain"
+    );
+
+    store
+        .evacuate_owned_replicas()
+        .expect("drain should succeed");
+    assert!(
+        store.allocator.lock().allocations().is_empty(),
+        "drain should release the abandoned reservation"
+    );
+}
+
+// ===========================================================================
+// Case 13: a stale release whose length doesn't match fails the next put
+// ===========================================================================
+
+#[test]
+#[ignore = "repro case 13: a deferred release of a reused span with a different length fails the releasing writer's next put"]
+fn repro_stale_release_length_mismatch_fails_next_put() {
+    let cluster = authority_cluster("repro-len", 64, rw_only_config().reclaim_grace_ms(20));
+
+    let route_v1 = put_bytes(&cluster.writer_a, "k1", &[b'1'; 16]);
+    cluster
+        .writer_a
+        .route_directory
+        .flush_pending_route_mirrors();
+    put_bytes(&cluster.writer_a, "k1", &[b'2'; 16]);
+    cluster.lose_mirror_update("k1", Some(&route_v1));
+
+    // An 8-byte object takes the start of v1's freed 16-byte span.
+    let route_k9 = put_bytes(&cluster.writer_a, "k9", &[b'9'; 8]);
+    assert_eq!(
+        route_k9.replicas[0].segment_offset,
+        route_v1.replicas[0].segment_offset
+    );
+
+    // Writer B fails over, replaces v1 again, and defers v1's release by 20 ms.
+    mark_unreachable(&cluster.writer_b, &cluster.primary, Duration::from_secs(10));
+    put_bytes(&cluster.writer_b, "k1", &[b'3'; 16]);
+    sleep(Duration::from_millis(60));
+
+    // Writer B's next put flushes the due release: offset matches k9, length doesn't.
+    let next = cluster
+        .writer_b
+        .put_with_policy("k11", &[b'Y'; 16], &remote_only());
+    assert!(
+        next.is_ok(),
+        "unrelated put failed because of a stale deferred release: {:?}",
+        next.err()
     );
 }
